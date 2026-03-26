@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure EVSE Master UDP",
+        "description": "Set up a charger using discovery or a static EVSE IP.",
+        "data": {
+          "serial": "Serial number",
+          "password": "Password",
+          "host": "EVSE IP address",
+          "port": "UDP port",
+          "name": "Name"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the EVSE.",
+      "invalid_auth": "Invalid serial number or password.",
+      "invalid_host": "Invalid EVSE IP address.",
+      "unknown": "Unexpected error."
+    }
+  }
+}

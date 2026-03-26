@@ -1,0 +1,61 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Temporary tests and debug scripts
+test_*.tmp
+test_*.py
+debug_*.py
+capture_*.py
+payload_*.hex
+# Exclude temporary root-level tests, keep tests/ organized
+!/tests/test_*.py
+
+# Home Assistant specific
+home-assistant.log
+*.db
+
+# Reference files and technical documentation (keep local only)
+original_typescript/
+DATAGRAMMES_DOCUMENTATION.md
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+home-assistant_v2.db
+.storage/
+.cloud/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Tests
+tests/output/
+tests/logs/
+*.db
+dist/
