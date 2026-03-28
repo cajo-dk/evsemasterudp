@@ -173,6 +173,71 @@ async def test_login_response_not_overwritten_by_discovery():
         return False, str(e)
 
 
+async def test_login_fallback_after_endpoint_refresh():
+    """A login should retry after discovery updates the endpoint."""
+    try:
+        print("Testing login fallback after endpoint refresh...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import Heading, LoginConfirm, LoginResponse, RequestLogin
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 28376)
+        request_attempts = 0
+
+        async def fake_send_datagram(datagram):
+            nonlocal request_attempts
+            if isinstance(datagram, RequestLogin):
+                request_attempts += 1
+                if request_attempts == 1:
+                    async def refresh_endpoint():
+                        await asyncio.sleep(0.1)
+                        evse.info.port = 48076
+                    asyncio.create_task(refresh_endpoint())
+                else:
+                    response = LoginResponse()
+                    response.set_device_serial(evse.info.serial)
+                    await comm._process_datagram(response, (evse.info.ip, evse.info.port))
+            elif isinstance(datagram, (LoginConfirm, Heading)):
+                return 0
+            return 0
+
+        evse.send_datagram = fake_send_datagram
+        ok = await evse.login("032818")
+
+        if not ok:
+            return False, f"login fallback failed with reason {evse.auth_failure_reason}"
+        if request_attempts != 2:
+            return False, f"expected 2 login attempts, got {request_attempts}"
+        if evse.info.port != 48076:
+            return False, f"expected refreshed port 48076, got {evse.info.port}"
+
+        print("  OK Login retried after endpoint refresh")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_login_failure_reason():
+    """Login state should retain a failure reason for diagnostics."""
+    try:
+        print("Testing login failure reason...")
+
+        from protocol.communicator import Communicator
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.auth_failure_reason = "no_login_response"
+
+        if evse.auth_failure_reason != "no_login_response":
+            return False, "auth failure reason was not retained on the EVSE object"
+
+        print("  OK Login failure reason retained for diagnostics")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 async def main():
     """Run all tests."""
     print("=== QUICK EVSE PYTHON PROTOCOL TEST ===\n")
@@ -185,6 +250,8 @@ async def main():
         ("Network socket", test_network_socket),
         ("Static endpoint refresh", test_static_endpoint_port_refresh),
         ("Login response buffering", test_login_response_not_overwritten_by_discovery),
+        ("Login fallback", test_login_fallback_after_endpoint_refresh),
+        ("Login failure reason", test_login_failure_reason),
     ]
 
     results = []

@@ -174,6 +174,26 @@ class EVSEClient:
             return False
         
         return await evse.login(password)
+
+    def get_login_diagnostics(self, serial: str) -> Dict[str, Any]:
+        """Return login diagnostics for logs and troubleshooting."""
+        evse = self.communicator.get_evse(serial)
+        if not evse:
+            return {"found": False}
+
+        return {
+            "found": True,
+            "ip": evse.info.ip,
+            "port": evse.info.port,
+            "online": evse.is_online(),
+            "logged_in": evse.is_logged_in(),
+            "auth_failure_reason": getattr(evse, "auth_failure_reason", None),
+            "last_response_command": (
+                f"0x{evse._last_response.get_command():04x}"
+                if getattr(evse, "_last_response", None)
+                else None
+            ),
+        }
     
     async def start_charging(self, serial: str, amps: int = None, single_phase: bool = False) -> bool:
         """Start charging"""

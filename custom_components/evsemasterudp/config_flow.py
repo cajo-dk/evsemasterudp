@@ -134,12 +134,22 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         # Test connection with retry
         success = await client.login(serial, password)
         if not success:
+            _LOGGER.warning(
+                "Auth attempt failed for %s with diagnostics: %s",
+                serial,
+                client.get_login_diagnostics(serial),
+            )
             # Only one retry to avoid blocking the EVSE
             _LOGGER.warning(f"First auth attempt failed for {serial}, retrying...")
             await asyncio.sleep(2)
             success = await client.login(serial, password)
 
         if not success:
+            _LOGGER.error(
+                "Authentication failed for %s after retry with diagnostics: %s",
+                serial,
+                client.get_login_diagnostics(serial),
+            )
             raise InvalidAuth
 
         _LOGGER.info(f"Successfully connected to EVSE {serial}")

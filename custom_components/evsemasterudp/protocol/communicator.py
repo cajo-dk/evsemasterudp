@@ -101,6 +101,7 @@ class EVSE:
         self._logged_in = False
         self._last_response = None  # To wait for authentication responses
         self._response_buffer: List[Datagram] = []
+        self.auth_failure_reason: Optional[str] = None
         
         # Possible states according to the protocol
         self.GUN_STATES = {
@@ -167,61 +168,104 @@ class EVSE:
     async def login(self, password: str) -> bool:
         """Log in to the EVSE following the TypeScript sequence"""
         try:
-            _LOGGER.info(f"Attempting to connect to {self.info.serial} with password")
-            
-            # 0. Reset connection state before starting
-            self._logged_in = False
-            self.last_active_login = None
-            self._response_buffer.clear()
-            self._last_response = None
-            
-            # 1. Send RequestLogin with password
-            login_request = RequestLogin()
-            login_request.set_device_serial(self.info.serial)
-            login_request.set_device_password(password)
-            
-            await self.send_datagram(login_request)
-            _LOGGER.debug(f"RequestLogin sent to {self.info.serial}")
-            
-            # 2. Wait for LoginResponse or PasswordErrorResponse (max 3 seconds)
-            response = await self._wait_for_response([LoginResponse.COMMAND, PasswordErrorResponse.COMMAND], 3.0)
-            
-            if response and response.get_command() == PasswordErrorResponse.COMMAND:
-                _LOGGER.error(f"Incorrect password for {self.info.serial}")
+            self.auth_failure_reason = None
+            initial_endpoint = (self.info.ip, self.info.port)
+            _LOGGER.info(
+                f"Attempting to connect to {self.info.serial} via {self.info.ip}:{self.info.port}"
+            )
+
+            response = await self._login_once(password)
+            if response and response.get_command() == LoginResponse.COMMAND:
+                return True
+
+            if self.auth_failure_reason == "incorrect_password":
                 return False
-            
-            if not response or response.get_command() != LoginResponse.COMMAND:
-                _LOGGER.error(f"No login response from {self.info.serial}")
-                return False
-            
-            # 3. Password correct, save and send LoginConfirm
-            self.password = password
-            _LOGGER.info(f"Password accepted for {self.info.serial}")
-            
-            # 4. Send LoginConfirm to finalize
-            login_confirm = LoginConfirm()
-            login_confirm.set_device_serial(self.info.serial)
-            login_confirm.set_device_password(password)
-            
-            await self.send_datagram(login_confirm)
-            _LOGGER.debug(f"LoginConfirm sent to {self.info.serial}")
-            
-            # 5. Mark as connected
-            self._logged_in = True
-            self.last_active_login = datetime.now()
-            _LOGGER.info(f"Connection established with {self.info.serial}")
-            
-            # 6. Request configuration (like TypeScript)
-            try:
-                await self._fetch_config()
-            except Exception as e:
-                _LOGGER.warning(f"Unable to retrieve config for {self.info.serial}: {e}")
-            
-            return True
+
+            refreshed = await self._wait_for_endpoint_change(*initial_endpoint, timeout=5.0)
+            if refreshed:
+                _LOGGER.info(
+                    f"Retrying login for {self.info.serial} using discovered endpoint "
+                    f"{self.info.ip}:{self.info.port}"
+                )
+                response = await self._login_once(password)
+                if response and response.get_command() == LoginResponse.COMMAND:
+                    return True
+
+            if self.auth_failure_reason == "no_login_response":
+                _LOGGER.error(
+                    f"No login response from {self.info.serial} using {self.info.ip}:{self.info.port}"
+                )
+            return False
                 
         except Exception as e:
+            self.auth_failure_reason = "transport_error"
             _LOGGER.error(f"Error while connecting to {self.info.serial}: {e}")
             return False
+
+    async def _login_once(self, password: str) -> Optional[Datagram]:
+        """Perform a single login attempt against the current endpoint."""
+        self._logged_in = False
+        self.last_active_login = None
+        self._response_buffer.clear()
+        self._last_response = None
+
+        login_request = RequestLogin()
+        login_request.set_device_serial(self.info.serial)
+        login_request.set_device_password(password)
+
+        await self.send_datagram(login_request)
+        _LOGGER.debug(
+            f"RequestLogin sent to {self.info.serial} via {self.info.ip}:{self.info.port}"
+        )
+
+        response = await self._wait_for_response(
+            [LoginResponse.COMMAND, PasswordErrorResponse.COMMAND], 3.0
+        )
+
+        if response and response.get_command() == PasswordErrorResponse.COMMAND:
+            self.auth_failure_reason = "incorrect_password"
+            _LOGGER.error(
+                f"Incorrect password for {self.info.serial} at {self.info.ip}:{self.info.port}"
+            )
+            return response
+
+        if not response or response.get_command() != LoginResponse.COMMAND:
+            self.auth_failure_reason = "no_login_response"
+            _LOGGER.warning(
+                f"No login response from {self.info.serial} at {self.info.ip}:{self.info.port}"
+            )
+            return response
+
+        self.password = password
+        self.auth_failure_reason = None
+        _LOGGER.info(f"Password accepted for {self.info.serial}")
+
+        login_confirm = LoginConfirm()
+        login_confirm.set_device_serial(self.info.serial)
+        login_confirm.set_device_password(password)
+
+        await self.send_datagram(login_confirm)
+        _LOGGER.debug(f"LoginConfirm sent to {self.info.serial}")
+
+        self._logged_in = True
+        self.last_active_login = datetime.now()
+        _LOGGER.info(f"Connection established with {self.info.serial}")
+
+        try:
+            await self._fetch_config()
+        except Exception as e:
+            _LOGGER.warning(f"Unable to retrieve config for {self.info.serial}: {e}")
+
+        return response
+
+    async def _wait_for_endpoint_change(self, ip: str, port: int, timeout: float = 5.0) -> bool:
+        """Wait for discovery traffic to update the EVSE endpoint."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if self.info.ip != ip or self.info.port != port:
+                return True
+            await asyncio.sleep(0.1)
+        return False
     
     async def _wait_for_response(self, expected_commands: list, timeout: float):
         """Wait for a response with specific commands"""
