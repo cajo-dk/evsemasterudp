@@ -61,6 +61,22 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
 
+
+async def _wait_for_discovery_refresh(
+    serial: str, client, expected_host: str, expected_port: int, timeout: float = 5.0
+) -> None:
+    """Give the communicator a chance to learn the EVSE reply port from broadcasts."""
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        evse = client.get_evse(serial)
+        if evse and (
+            evse.get("ip") != expected_host or evse.get("port") != expected_port
+        ):
+            break
+        await asyncio.sleep(0.1)
+
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate user input data"""
     serial = data["serial"]
@@ -91,6 +107,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
         if host:
             client.ensure_evse(serial, host, port)
+            await _wait_for_discovery_refresh(serial, client, host, port)
             _LOGGER.info(f"Using configured EVSE endpoint {serial} @ {host}:{port}")
         else:
             # Wait longer to discover EVSEs (like test_full.py)

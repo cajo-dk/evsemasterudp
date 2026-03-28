@@ -24,6 +24,20 @@ PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER]
  # Update interval (in seconds)
 UPDATE_INTERVAL = timedelta(seconds=60)
 
+
+async def _wait_for_discovery_refresh(
+    serial: str, client: EVSEClient, expected_host: str, expected_port: int, timeout: float = 5.0
+) -> None:
+    """Give the communicator a chance to learn the EVSE reply port from broadcasts."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        evse = client.get_evse(serial)
+        if evse and (
+            evse.get("ip") != expected_host or evse.get("port") != expected_port
+        ):
+            break
+        await asyncio.sleep(0.1)
+
 class EVSEDataUpdateCoordinator(DataUpdateCoordinator):
     """Coordinator to update EVSE data"""
 
@@ -82,6 +96,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if host:
         client.ensure_evse(serial, host, port)
+        await _wait_for_discovery_refresh(serial, client, host, port)
     else:
         # Wait a bit to discover EVSEs
         await asyncio.sleep(3)

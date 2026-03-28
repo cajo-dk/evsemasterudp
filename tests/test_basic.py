@@ -1,175 +1,190 @@
 #!/usr/bin/env python3
 """
-Basic EVSE Python protocol test
-Minimal version for quick validation
+Basic EVSE protocol sanity tests.
 """
 
 import asyncio
-import sys
 import os
+import sys
 
-# Add the protocol path from custom_components
-# Use the relative path from this file
+
 test_dir = os.path.dirname(__file__)
 project_root = os.path.dirname(test_dir)
-evse_module_path = os.path.join(project_root, 'custom_components', 'evsemasterudp')
+evse_module_path = os.path.join(project_root, "custom_components", "evsemasterudp")
 sys.path.insert(0, evse_module_path)
 
+
 async def test_basic_import():
-    """Test basic import"""
+    """Test basic imports."""
     try:
-        print("🔍 Testing module imports...")
-        
-        # Test import datagram
+        print("Testing module imports...")
+
         from protocol.datagram import Datagram
-        print("  ✅ Datagram imported")
-        
-        # Test import communicator
         from protocol.communicator import Communicator
-        print("  ✅ Communicator imported")
-        
-        # Test import datagrams
         from protocol.datagrams import RequestLogin, Heading, SingleACStatus
-        print("  ✅ Datagrams imported")
-        
+
+        assert Datagram is not None
+        assert Communicator is not None
+        assert RequestLogin is not None
+        assert Heading is not None
+        assert SingleACStatus is not None
+
+        print("  OK imports loaded")
         return True, None
-        
     except Exception as e:
         return False, str(e)
+
 
 async def test_datagram_creation():
-    """Test datagram creation"""
+    """Test datagram creation."""
     try:
-        print("🔧 Testing datagram creation...")
-        
-        from protocol.datagrams import RequestLogin, Heading
-        
-        # Test RequestLogin creation
+        print("Testing datagram creation...")
+
+        from protocol.datagrams import Heading, RequestLogin
+
         login = RequestLogin()
-        print(f"  ✅ RequestLogin created (command: 0x{login.COMMAND:04x})")
-        
-        # Test Heading creation
         heading = Heading()
-        print(f"  ✅ Heading created (command: 0x{heading.COMMAND:04x})")
-        
+
+        print(f"  OK RequestLogin command=0x{login.COMMAND:04x}")
+        print(f"  OK Heading command=0x{heading.COMMAND:04x}")
         return True, None
-        
     except Exception as e:
         return False, str(e)
+
 
 async def test_datagram_packing():
-    """Test encoding/decoding"""
+    """Test datagram packing."""
     try:
-        print("📦 Testing encoding/decoding...")
-        
+        print("Testing datagram packing...")
+
         from protocol.datagrams import RequestLogin
-        
-        # Create a datagram
+
         login = RequestLogin()
-        login.serial = "1368844619649410"
-        login.password = "123456"
-        
-        # Encode
+        login.set_device_serial("1368844619649410")
+        login.set_device_password("123456")
+
         packed = login.pack()
-        print(f"  ✅ Datagram encoded ({len(packed)} bytes)")
+        print(f"  OK Datagram encoded ({len(packed)} bytes)")
         print(f"     Hex: {packed.hex()}")
-        
         return True, None
-        
     except Exception as e:
         return False, str(e)
+
 
 async def test_communicator_creation():
-    """Test communicator creation"""
+    """Test communicator creation."""
     try:
-        print("📡 Testing communicator creation...")
-        
+        print("Testing communicator creation...")
+
         from protocol.communicator import Communicator
-        
-        # Create communicator
+
         comm = Communicator()
-        print("  ✅ Communicator created")
-        print(f"     Port: {comm.port}")
-        
+        print(f"  OK Communicator created on port {comm.port}")
         return True, None
-        
     except Exception as e:
         return False, str(e)
+
 
 async def test_network_socket():
-    """Test UDP socket creation"""
+    """Test UDP socket creation."""
     try:
-        print("🌐 Test socket UDP...")
-        
+        print("Testing UDP socket...")
+
         import socket
-        
-        # Create UDP socket
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        
-        # Test bind
-        sock.bind(('', 0))  # Automatic port
+        sock.bind(("", 0))
         port = sock.getsockname()[1]
-        print(f"  ✅ UDP socket created on port {port}")
-        
         sock.close()
-        
+
+        print(f"  OK UDP socket created on port {port}")
         return True, None
-        
     except Exception as e:
         return False, str(e)
 
+
+async def test_static_endpoint_port_refresh():
+    """A discovered EVSE port should override the static config port."""
+    try:
+        print("Testing static endpoint port refresh...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import Login
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 28376)
+
+        login = Login()
+        login.set_device_serial("7794824171431560")
+        login.brand = "EVSE"
+        login.model = "BS20"
+        login.hardware_version = "20.3251.114C00A3"
+        login.max_power = 21120
+        login.max_electricity = 32
+        login.hot_line = "WWW.EVSE.COM"
+
+        await comm._process_datagram(login, ("10.254.2.39", 48076))
+
+        if evse.info.port != 48076:
+            return False, f"expected discovered port 48076, got {evse.info.port}"
+        if evse.is_logged_in():
+            return False, "discovery packet should not mark EVSE logged in"
+
+        print("  OK Discovery updated the EVSE endpoint port")
+        print("  OK Discovery did not mark the EVSE logged in")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 async def main():
-    """Main tests"""
-    print("🧪 === QUICK EVSE PYTHON PROTOCOL TEST ===\n")
-    
+    """Run all tests."""
+    print("=== QUICK EVSE PYTHON PROTOCOL TEST ===\n")
+
     tests = [
         ("Module imports", test_basic_import),
         ("Datagram creation", test_datagram_creation),
-        ("Encoding/decoding", test_datagram_packing),
+        ("Datagram packing", test_datagram_packing),
         ("Communicator", test_communicator_creation),
         ("Network socket", test_network_socket),
+        ("Static endpoint refresh", test_static_endpoint_port_refresh),
     ]
-    
+
     results = []
-    
+
     for test_name, test_func in tests:
-        print(f"🔬 {test_name}...")
+        print(f"Running {test_name}...")
         try:
             success, error = await test_func()
             if success:
-                print(f"   ✅ {test_name} OK\n")
+                print(f"  PASS {test_name}\n")
                 results.append((test_name, True, None))
             else:
-                print(f"   ❌ {test_name} ERROR: {error}\n")
+                print(f"  FAIL {test_name}: {error}\n")
                 results.append((test_name, False, error))
         except Exception as e:
-                print(f"   ❌ {test_name} EXCEPTION: {e}\n")
+            print(f"  EXCEPTION {test_name}: {e}\n")
             results.append((test_name, False, str(e)))
-    
-    # Summary
+
     print("=" * 50)
-    print("📋 TEST SUMMARY:")
-    
+    print("TEST SUMMARY:")
+
     passed = 0
     for test_name, success, error in results:
-        status = "✅ OK" if success else "❌ KO"
-        print(f"   {status} {test_name}")
+        status = "PASS" if success else "FAIL"
+        print(f"  {status} {test_name}")
         if success:
             passed += 1
-    
-    print(f"\n📊 Result: {passed}/{len(tests)} tests passed")
-    
-    if passed == len(tests):
-        print("\n🎉 All basic tests passed!")
-        print("   You can now test with a real EVSE:")
-        print(f"   python test_python_protocol.py")
-    else:
-        print("\n⚠️ Some tests failed - check the configuration")
-        print("   Errors detected:")
+
+    print(f"\nResult: {passed}/{len(tests)} tests passed")
+
+    if passed != len(tests):
+        print("\nErrors detected:")
         for test_name, success, error in results:
             if not success:
-                print(f"     • {test_name}: {error}")
+                print(f"  - {test_name}: {error}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

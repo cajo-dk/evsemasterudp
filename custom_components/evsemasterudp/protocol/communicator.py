@@ -529,13 +529,7 @@ class Communicator:
         evse.info.can_force_single_phase = datagram.can_force_single_phase
         evse.info.feature = datagram.feature
         evse.info.support_new = datagram.support_new
-        # Confirm login
-        confirm = LoginConfirm()
-        confirm.set_device_serial(evse.info.serial)
-        confirm.set_device_password(evse.password)
-        await evse.send_datagram(confirm)
-        evse._logged_in = True
-        await self._notify_callbacks('evse_logged_in', evse)
+        await self._notify_callbacks('evse_changed', evse)
     
     async def _handle_status(self, evse: EVSE, datagram: SingleACStatus):
         """Handle an AC status"""
