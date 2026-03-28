@@ -105,9 +105,9 @@ async def test_network_socket():
 
 
 async def test_static_endpoint_port_refresh():
-    """A discovered EVSE port should override the static config port."""
+    """A configured static EVSE endpoint should stay pinned."""
     try:
-        print("Testing static endpoint port refresh...")
+        print("Testing static endpoint pinning...")
 
         from protocol.communicator import Communicator
         from protocol.datagrams import Login
@@ -126,12 +126,12 @@ async def test_static_endpoint_port_refresh():
 
         await comm._process_datagram(login, ("10.254.2.39", 48076))
 
-        if evse.info.port != 48076:
-            return False, f"expected discovered port 48076, got {evse.info.port}"
+        if evse.info.port != 28376:
+            return False, f"expected pinned port 28376, got {evse.info.port}"
         if evse.is_logged_in():
             return False, "discovery packet should not mark EVSE logged in"
 
-        print("  OK Discovery updated the EVSE endpoint port")
+        print("  OK Direct endpoint remained pinned to the configured port")
         print("  OK Discovery did not mark the EVSE logged in")
         return True, None
     except Exception as e:
@@ -178,11 +178,12 @@ async def test_login_fallback_after_endpoint_refresh():
     try:
         print("Testing login fallback after endpoint refresh...")
 
-        from protocol.communicator import Communicator
+        from protocol.communicator import Communicator, EVSE
         from protocol.datagrams import Heading, LoginConfirm, LoginResponse, RequestLogin
 
         comm = Communicator()
-        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 28376)
+        evse = EVSE(comm, "7794824171431560", "10.254.2.39", 28376)
+        comm.evses[evse.info.serial] = evse
         request_attempts = 0
 
         async def fake_send_datagram(datagram):
@@ -218,6 +219,42 @@ async def test_login_fallback_after_endpoint_refresh():
         return False, str(e)
 
 
+async def test_direct_login_does_not_wait_for_discovery():
+    """A pinned endpoint should not retry on a discovered port."""
+    try:
+        print("Testing direct login mode...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import RequestLogin
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 28376)
+        request_attempts = 0
+
+        async def fake_send_datagram(datagram):
+            nonlocal request_attempts
+            if isinstance(datagram, RequestLogin):
+                request_attempts += 1
+            return 0
+
+        evse.send_datagram = fake_send_datagram
+        ok = await evse.login("032818")
+
+        if ok:
+            return False, "expected direct login without a response to fail"
+        if request_attempts != 1:
+            return False, f"expected 1 login attempt in direct mode, got {request_attempts}"
+        if evse.info.port != 28376:
+            return False, f"expected pinned port 28376 after failure, got {evse.info.port}"
+        if evse.auth_failure_reason != "no_login_response":
+            return False, f"unexpected auth failure reason {evse.auth_failure_reason}"
+
+        print("  OK Direct mode stayed on the configured endpoint")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 async def test_login_failure_reason():
     """Login state should retain a failure reason for diagnostics."""
     try:
@@ -248,9 +285,10 @@ async def main():
         ("Datagram packing", test_datagram_packing),
         ("Communicator", test_communicator_creation),
         ("Network socket", test_network_socket),
-        ("Static endpoint refresh", test_static_endpoint_port_refresh),
+        ("Static endpoint pinning", test_static_endpoint_port_refresh),
         ("Login response buffering", test_login_response_not_overwritten_by_discovery),
         ("Login fallback", test_login_fallback_after_endpoint_refresh),
+        ("Direct login mode", test_direct_login_does_not_wait_for_discovery),
         ("Login failure reason", test_login_failure_reason),
     ]
 

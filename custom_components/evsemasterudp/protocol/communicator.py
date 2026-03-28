@@ -88,12 +88,20 @@ class EVSECurrentCharge:
 class EVSE:
     """Representation of an EVSE"""
     
-    def __init__(self, communicator: 'Communicator', serial: str, ip: str, port: int):
+    def __init__(
+        self,
+        communicator: 'Communicator',
+        serial: str,
+        ip: str,
+        port: int,
+        endpoint_locked: bool = False,
+    ):
         self.communicator = communicator
         self.info = EVSEInfo(serial, ip, port)
         self.config = EVSEConfig()
         self.state: Optional[EVSEState] = None
         self.current_charge: Optional[EVSECurrentCharge] = None
+        self.endpoint_locked = endpoint_locked
         
         self.last_seen = datetime.now()
         self.last_active_login: Optional[datetime] = None
@@ -117,6 +125,8 @@ class EVSE:
     def update_ip(self, ip: str, port: int) -> bool:
         """Update IP and port"""
         self.last_seen = datetime.now()
+        if self.endpoint_locked:
+            return False
         changed = False
         
         if ip != self.info.ip:
@@ -181,7 +191,9 @@ class EVSE:
             if self.auth_failure_reason == "incorrect_password":
                 return False
 
-            refreshed = await self._wait_for_endpoint_change(*initial_endpoint, timeout=5.0)
+            refreshed = False
+            if not self.endpoint_locked:
+                refreshed = await self._wait_for_endpoint_change(*initial_endpoint, timeout=5.0)
             if refreshed:
                 _LOGGER.info(
                     f"Retrying login for {self.info.serial} using discovered endpoint "
@@ -754,12 +766,16 @@ class Communicator:
         """Register or update a known EVSE endpoint without waiting for discovery."""
         evse = self.evses.get(serial)
         if evse is None:
-            evse = EVSE(self, serial, ip, port)
+            evse = EVSE(self, serial, ip, port, endpoint_locked=True)
             self.evses[serial] = evse
             _LOGGER.info(f"Static EVSE registered: {serial} @ {ip}:{port}")
             return evse
 
-        if evse.update_ip(ip, port):
+        evse.endpoint_locked = True
+        if evse.info.ip != ip or evse.info.port != port:
+            evse.info.ip = ip
+            evse.info.port = port
+            evse.last_seen = datetime.now()
             _LOGGER.info(f"Static EVSE endpoint updated: {serial} @ {ip}:{port}")
         return evse
     
