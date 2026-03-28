@@ -138,6 +138,41 @@ async def test_static_endpoint_port_refresh():
         return False, str(e)
 
 
+async def test_login_response_not_overwritten_by_discovery():
+    """A login response must survive later discovery packets."""
+    try:
+        print("Testing login response buffering...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import Login, LoginResponse
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+
+        login_response = LoginResponse()
+        login_response.set_device_serial("7794824171431560")
+        await comm._process_datagram(login_response, ("10.254.2.39", 48076))
+
+        discovery = Login()
+        discovery.set_device_serial("7794824171431560")
+        discovery.brand = "EVSE"
+        discovery.model = "BS20"
+        discovery.hardware_version = "20.3251.114C00A3"
+        discovery.max_power = 21120
+        discovery.max_electricity = 32
+        discovery.hot_line = "WWW.EVSE.COM"
+        await comm._process_datagram(discovery, ("10.254.2.39", 48076))
+
+        response = await evse._wait_for_response([LoginResponse.COMMAND], 0.2)
+        if response is None or response.get_command() != LoginResponse.COMMAND:
+            return False, "login response was lost after discovery traffic"
+
+        print("  OK LoginResponse remained available after discovery traffic")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 async def main():
     """Run all tests."""
     print("=== QUICK EVSE PYTHON PROTOCOL TEST ===\n")
@@ -149,6 +184,7 @@ async def main():
         ("Communicator", test_communicator_creation),
         ("Network socket", test_network_socket),
         ("Static endpoint refresh", test_static_endpoint_port_refresh),
+        ("Login response buffering", test_login_response_not_overwritten_by_discovery),
     ]
 
     results = []

@@ -100,6 +100,7 @@ class EVSE:
         self.password: Optional[str] = None
         self._logged_in = False
         self._last_response = None  # To wait for authentication responses
+        self._response_buffer: List[Datagram] = []
         
         # Possible states according to the protocol
         self.GUN_STATES = {
@@ -171,6 +172,8 @@ class EVSE:
             # 0. Reset connection state before starting
             self._logged_in = False
             self.last_active_login = None
+            self._response_buffer.clear()
+            self._last_response = None
             
             # 1. Send RequestLogin with password
             login_request = RequestLogin()
@@ -223,17 +226,14 @@ class EVSE:
     async def _wait_for_response(self, expected_commands: list, timeout: float):
         """Wait for a response with specific commands"""
         start_time = asyncio.get_event_loop().time()
-        
-    # Ignore any previous response by resetting to zero
-        self._last_response = None
-        
+
         while (asyncio.get_event_loop().time() - start_time) < timeout:
-            # Check if a new response with an expected command was received
-            if self._last_response and self._last_response.get_command() in expected_commands:
-                response = self._last_response
-                self._last_response = None  # Consume the response
-                return response
-            
+            for index, response in enumerate(self._response_buffer):
+                if response.get_command() in expected_commands:
+                    self._response_buffer.pop(index)
+                    self._last_response = response
+                    return response
+
             await asyncio.sleep(0.1)
         
         return None
@@ -482,7 +482,8 @@ class Communicator:
                 await self._notify_callbacks('evse_changed', evse)
         # Update last_seen and store the response for authentication
         evse.last_seen = datetime.now()
-        evse._last_response = datagram  # Store for _wait_for_response
+        evse._last_response = datagram  # Keep the latest datagram for diagnostics
+        evse._response_buffer.append(datagram)
         # Handle the specific datagram
         if isinstance(datagram, Login):
             await self._handle_login(evse, datagram)
@@ -619,7 +620,6 @@ class Communicator:
         evse.current_charge.charge_price = datagram.charge_price
         evse.current_charge.fee_type = datagram.fee_type
         evse.current_charge.charge_fee = datagram.charge_fee
-        evse._last_response = datagram  # Store for _wait_for_response
         await self._notify_callbacks('evse_charge_changed', evse)
     
     async def _handle_heading(self, evse: EVSE, datagram: Heading):
