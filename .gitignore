@@ -48,6 +48,8 @@ dist/
 home-assistant_v2.db
 .storage/
 .cloud/
+homey-evse-proxy/node_modules/
+homey-evse-proxy/.homeybuild/
 
 # OS
 .DS_Store
