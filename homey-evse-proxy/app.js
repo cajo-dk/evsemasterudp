@@ -142,6 +142,8 @@ class EVSEProxySession {
     };
     this.discoveryPublished = false;
     this.connectPromise = null;
+    this.chargingStateOverride = null;
+    this.chargingStateOverrideTimer = null;
   }
 
   log(message, details = null) {
@@ -269,6 +271,7 @@ class EVSEProxySession {
       endpoint: this.evse.ip && this.evse.port ? `${this.evse.ip}:${this.evse.port}` : null,
       serial: this.evse.serial,
       loggedIn: this.loggedIn,
+      effectiveLoggedIn: this.effectiveLoggedIn(),
       mqttConnected: this.mqttConnected,
       authFailureReason: this.authFailureReason,
       lastSeen: this.lastSeen,
@@ -290,6 +293,7 @@ class EVSEProxySession {
       serial: this.evse.serial,
       endpoint: this.evse.ip && this.evse.port ? `${this.evse.ip}:${this.evse.port}` : null,
       loggedIn: this.loggedIn,
+      effectiveLoggedIn: this.effectiveLoggedIn(),
       mqttConnected: this.mqttConnected,
       authFailureReason: this.authFailureReason,
       lastSeen: this.lastSeen,
@@ -453,14 +457,80 @@ class EVSEProxySession {
     if (!status) {
       return false;
     }
-    return [2, 3, 4].includes(status.gunState);
+    // Field observations show gunState=2 can still mean unplugged/idle on some units.
+    // Treat only the higher states as truly plugged to avoid false positives.
+    return [3, 4].includes(status.gunState);
   }
 
   isCharging(status = this.lastStatus) {
     if (!status) {
       return false;
     }
-    return status.outputState === 1 || status.currentPower > 10;
+    return status.outputState === 1;
+  }
+
+  hasRecentEvseTraffic(maxAgeMs = 180000) {
+    if (!this.lastSeen) {
+      return false;
+    }
+    const lastSeenMs = Date.parse(this.lastSeen);
+    if (Number.isNaN(lastSeenMs)) {
+      return false;
+    }
+    return (Date.now() - lastSeenMs) <= maxAgeMs;
+  }
+
+  effectiveLoggedIn() {
+    if (this.loggedIn) {
+      return true;
+    }
+
+    if (['incorrect_password', 'discovery_timeout'].includes(this.authFailureReason)) {
+      return false;
+    }
+
+    return this.hasRecentEvseTraffic();
+  }
+
+  clearChargingStateOverride() {
+    this.chargingStateOverride = null;
+    if (this.chargingStateOverrideTimer) {
+      this.homey.clearTimeout(this.chargingStateOverrideTimer);
+      this.chargingStateOverrideTimer = null;
+    }
+  }
+
+  setChargingStateOverride(enabled, timeoutMs = 30000) {
+    this.clearChargingStateOverride();
+    this.chargingStateOverride = {
+      value: Boolean(enabled),
+      expiresAt: Date.now() + timeoutMs,
+    };
+    this.chargingStateOverrideTimer = this.homey.setTimeout(() => {
+      this.clearChargingStateOverride();
+      if (this.lastStatus) {
+        this.publishStatus().catch((error) => this.error('Publish status failed', error));
+      }
+    }, timeoutMs);
+  }
+
+  effectiveChargingState(status = this.lastStatus) {
+    const actualCharging = this.isCharging(status);
+    if (!this.chargingStateOverride) {
+      return actualCharging;
+    }
+
+    if (actualCharging === this.chargingStateOverride.value) {
+      this.clearChargingStateOverride();
+      return actualCharging;
+    }
+
+    if (Date.now() < this.chargingStateOverride.expiresAt) {
+      return this.chargingStateOverride.value;
+    }
+
+    this.clearChargingStateOverride();
+    return actualCharging;
   }
 
   deriveEvseState(status = this.lastStatus) {
@@ -470,7 +540,7 @@ class EVSEProxySession {
     if (status.errorBits) {
       return 'error';
     }
-    if (this.isCharging(status)) {
+    if (this.effectiveChargingState(status)) {
       return 'plugged_charging';
     }
     if (this.isPluggedIn(status)) {
@@ -535,6 +605,10 @@ class EVSEProxySession {
         await this.connect();
       }
       await this.sendChargeStart();
+      this.setChargingStateOverride(true);
+      if (this.lastStatus) {
+        await this.publishStatus();
+      }
       return;
     }
 
@@ -543,6 +617,10 @@ class EVSEProxySession {
       return;
     }
     await this.sendChargeStop();
+    this.setChargingStateOverride(false);
+    if (this.lastStatus) {
+      await this.publishStatus();
+    }
   }
 
   startKeepAlive() {
@@ -853,7 +931,7 @@ class EVSEProxySession {
     const chargingCommandTopic = this.commandTopicFor('charging');
     const commonAvailability = {
       availability_topic: healthTopic,
-      availability_template: "{{ 'online' if value_json.loggedIn else 'offline' }}",
+      availability_template: "{{ 'online' if value_json.mqttConnected else 'offline' }}",
       payload_available: 'online',
       payload_not_available: 'offline',
     };
@@ -1015,7 +1093,7 @@ class EVSEProxySession {
         name: 'EVSE Proxy Logged In',
         unique_id: this.discoveryObjectId('logged_in'),
         state_topic: healthTopic,
-        value_template: "{{ value_json.loggedIn | string | lower }}",
+        value_template: "{{ value_json.effectiveLoggedIn | string | lower }}",
         payload_on: 'true',
         payload_off: 'false',
         device_class: 'connectivity',
@@ -1119,6 +1197,7 @@ class EVSEProxySession {
       serial: this.evse.serial,
       endpoint: this.evse.ip && this.evse.port ? `${this.evse.ip}:${this.evse.port}` : null,
       loggedIn: this.loggedIn,
+      effectiveLoggedIn: this.effectiveLoggedIn(),
       mqttConnected: this.mqttConnected,
       authFailureReason: this.authFailureReason,
       lastSeen: this.lastSeen,
@@ -1156,7 +1235,7 @@ class EVSEProxySession {
       summary: {
         evseState: this.deriveEvseState(this.lastStatus),
         pluggedIn: this.isPluggedIn(this.lastStatus),
-        charging: this.isCharging(this.lastStatus),
+        charging: this.effectiveChargingState(this.lastStatus),
         hasError: Boolean(this.lastStatus.errorBits),
       },
       status: this.lastStatus,
