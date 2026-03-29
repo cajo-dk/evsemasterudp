@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="EVSE Master Proxy">
+  <rect width="256" height="256" rx="48" fill="#102a43"/>
+  <path d="M78 52h68c18.8 0 34 15.2 34 34v84c0 18.8-15.2 34-34 34H78c-18.8 0-34-15.2-34-34V86c0-18.8 15.2-34 34-34Z" fill="#d9e2ec"/>
+  <path d="M92 80h40v32h16l-24 44v-30H92V80Z" fill="#f0b429"/>
+  <circle cx="166" cy="102" r="10" fill="#2bb0ed"/>
+  <circle cx="166" cy="134" r="10" fill="#2bb0ed"/>
+  <circle cx="166" cy="166" r="10" fill="#2bb0ed"/>
+  <path d="M178 194h18c8.8 0 16-7.2 16-16v-28c0-8.8-7.2-16-16-16h-4v-18c0-35.3-28.7-64-64-64h-8" fill="none" stroke="#2bb0ed" stroke-linecap="round" stroke-linejoin="round" stroke-width="12"/>
+</svg>

@@ -1,0 +1,48 @@
+{
+  "id": "dk.cajo.evsemasterproxy",
+  "version": "0.1.0",
+  "compatibility": ">=5.0.0",
+  "sdk": 3,
+  "runtime": "nodejs",
+  "platforms": ["local"],
+  "name": {
+    "en": "EVSE Master Proxy"
+  },
+  "description": {
+    "en": "Runs on Homey Pro to proxy a local EVSE Master charger for remote clients."
+  },
+  "category": "tools",
+  "author": {
+    "name": "Cajo DK"
+  },
+  "api": {
+    "getHealth": {
+      "method": "GET",
+      "path": "/health"
+    },
+    "getConfig": {
+      "method": "GET",
+      "path": "/config"
+    },
+    "setConfig": {
+      "method": "POST",
+      "path": "/config"
+    },
+    "connectProxy": {
+      "method": "POST",
+      "path": "/connect"
+    },
+    "getStatus": {
+      "method": "GET",
+      "path": "/status"
+    },
+    "refreshStatus": {
+      "method": "POST",
+      "path": "/refresh"
+    },
+    "getDiagnostics": {
+      "method": "GET",
+      "path": "/diagnostics"
+    }
+  }
+}

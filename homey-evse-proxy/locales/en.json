@@ -1,0 +1,6 @@
+{
+  "settings": {
+    "title": "EVSE Master Proxy",
+    "subtitle": "Configure the local EVSE connection used by the Homey-side proxy."
+  }
+}

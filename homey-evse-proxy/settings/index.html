@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>EVSE Master Proxy</title>
+    <script type="text/javascript" src="/homey.js" data-origin="settings"></script>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 24px;
+      }
+      .row {
+        margin-bottom: 12px;
+      }
+      label {
+        display: block;
+        margin-bottom: 4px;
+        font-weight: 600;
+      }
+      input[type="text"],
+      input[type="password"],
+      input[type="number"] {
+        width: 100%;
+        max-width: 420px;
+        padding: 8px;
+        box-sizing: border-box;
+      }
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 16px;
+      }
+      pre {
+        background: #111827;
+        color: #f9fafb;
+        padding: 12px;
+        border-radius: 8px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>EVSE Master Proxy</h1>
+    <p>Configure the charger that Homey Pro can reach on the local LAN.</p>
+
+    <div class="row">
+      <label for="serial">Serial</label>
+      <input id="serial" type="text" />
+    </div>
+    <div class="row">
+      <label for="password">Password</label>
+      <input id="password" type="password" />
+    </div>
+    <div class="row">
+      <label for="host">Host</label>
+      <input id="host" type="text" placeholder="Optional: leave empty to use discovery" />
+    </div>
+    <div class="row">
+      <label for="port">Port</label>
+      <input id="port" type="number" value="28376" />
+    </div>
+    <div class="row">
+      <label>
+        <input id="autoConnect" type="checkbox" checked />
+        Auto-connect when the app starts
+      </label>
+    </div>
+    <hr />
+    <div class="row">
+      <label for="mqttBrokerUrl">MQTT Broker URL</label>
+      <input id="mqttBrokerUrl" type="text" placeholder="mqtt://10.254.1.160:1883" />
+    </div>
+    <div class="row">
+      <label for="mqttUsername">MQTT Username</label>
+      <input id="mqttUsername" type="text" />
+    </div>
+    <div class="row">
+      <label for="mqttPassword">MQTT Password</label>
+      <input id="mqttPassword" type="password" />
+    </div>
+    <div class="row">
+      <label for="mqttBaseTopic">MQTT Base Topic</label>
+      <input id="mqttBaseTopic" type="text" value="homey/evse_master_proxy" />
+    </div>
+    <div class="row">
+      <label for="mqttClientId">MQTT Client ID</label>
+      <input id="mqttClientId" type="text" value="homey-evse-master-proxy" />
+    </div>
+
+    <div class="actions">
+      <button id="save" class="homey-button-primary">Save</button>
+      <button id="connect" class="homey-button-primary">Save and Connect</button>
+      <button id="refresh" class="homey-button-secondary">Refresh Status</button>
+    </div>
+
+    <h2>Diagnostics</h2>
+    <pre id="diagnostics">Loading...</pre>
+
+    <script type="text/javascript">
+      function onHomeyReady(Homey) {
+        const serial = document.getElementById('serial');
+        const password = document.getElementById('password');
+        const host = document.getElementById('host');
+        const port = document.getElementById('port');
+        const autoConnect = document.getElementById('autoConnect');
+        const mqttBrokerUrl = document.getElementById('mqttBrokerUrl');
+        const mqttUsername = document.getElementById('mqttUsername');
+        const mqttPassword = document.getElementById('mqttPassword');
+        const mqttBaseTopic = document.getElementById('mqttBaseTopic');
+        const mqttClientId = document.getElementById('mqttClientId');
+        const diagnostics = document.getElementById('diagnostics');
+
+        function readForm() {
+          return {
+            serial: serial.value.trim(),
+            password: password.value,
+            host: host.value.trim(),
+            port: Number(port.value || 28376),
+            autoConnect: autoConnect.checked,
+            mqttBrokerUrl: mqttBrokerUrl.value.trim(),
+            mqttUsername: mqttUsername.value.trim(),
+            mqttPassword: mqttPassword.value,
+            mqttBaseTopic: mqttBaseTopic.value.trim(),
+            mqttClientId: mqttClientId.value.trim(),
+          };
+        }
+
+        function applyForm(config) {
+          serial.value = config.serial || '';
+          password.value = config.password || '';
+          host.value = config.host || '';
+          port.value = config.port || 28376;
+          autoConnect.checked = config.autoConnect !== false;
+          mqttBrokerUrl.value = config.mqttBrokerUrl || '';
+          mqttUsername.value = config.mqttUsername || '';
+          mqttPassword.value = config.mqttPassword || '';
+          mqttBaseTopic.value = config.mqttBaseTopic || 'homey/evse_master_proxy';
+          mqttClientId.value = config.mqttClientId || 'homey-evse-master-proxy';
+        }
+
+        function renderDiagnostics(payload) {
+          diagnostics.textContent = JSON.stringify(payload, null, 2);
+        }
+
+        function loadAll() {
+          Homey.api('GET', '/config', null, function(err, config) {
+            if (err) return Homey.alert(err.message || String(err));
+            applyForm(config || {});
+          });
+
+          Homey.api('GET', '/diagnostics', null, function(err, result) {
+            if (err) return Homey.alert(err.message || String(err));
+            renderDiagnostics(result);
+          });
+        }
+
+        document.getElementById('save').addEventListener('click', function() {
+          Homey.api('POST', '/config', readForm(), function(err, result) {
+            if (err) return Homey.alert(err.message || String(err));
+            applyForm(result);
+            loadAll();
+          });
+        });
+
+        document.getElementById('connect').addEventListener('click', function() {
+          Homey.api('POST', '/connect', readForm(), function(err, result) {
+            if (err) return Homey.alert(err.message || String(err));
+            renderDiagnostics(result);
+          });
+        });
+
+        document.getElementById('refresh').addEventListener('click', function() {
+          Homey.api('POST', '/refresh', null, function(err, result) {
+            if (err) return Homey.alert(err.message || String(err));
+            renderDiagnostics(result);
+          });
+        });
+
+        loadAll();
+        Homey.ready();
+      }
+    </script>
+  </body>
+</html>

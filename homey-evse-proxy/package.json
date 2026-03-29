@@ -1,0 +1,12 @@
+{
+  "name": "homey-evse-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "main": "app.js",
+  "dependencies": {
+    "mqtt": "^5.10.4"
+  },
+  "scripts": {
+    "lint": "node -e \"console.log('No lint configured')\""
+  }
+}

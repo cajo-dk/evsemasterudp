@@ -112,6 +112,52 @@ Example of the device page in Home Assistant showing key sensors, charge control
 - Session history
 - Built-in protections
 
+## Status Code Cheat Sheet
+
+### Protocol Commands
+
+| Code | Meaning |
+| --- | --- |
+| `0x0001` | Charger discovery broadcast |
+| `0x0002` | Login response |
+| `0x0004` | Live status packet |
+| `0x0005` | Charging-session status packet |
+| `0x0155` | Password error |
+| `0x8001` | Login confirm sent by app |
+| `0x8002` | Login request sent by app |
+| `0x8004` | ACK for live status packet |
+
+### Live Status `0x0004`
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `gun_state` | `0` | Unknown |
+| `gun_state` | `1` | Disconnected |
+| `gun_state` | `2` | Connected, unlocked |
+| `gun_state` | `3` | Negotiating or transitional |
+| `gun_state` | `4` | Connected, locked |
+| `output_state` | `0` | Idle |
+| `output_state` | `1` | Charging |
+| `current_state` | varies | Present in payload, not fully decoded in this repo |
+| `errors` | `[]` | No active error bits |
+| `errors` | `[0, 3]` | Error bits 0 and 3 are active |
+
+### Charging Status `0x0005`
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `current_state` | `13` | Finished |
+| `current_state` | `14` | Charging |
+
+### Quick Read Summary
+
+| Raw status | Summary |
+| --- | --- |
+| `gun_state=0 output_state=0 errors=[]` | `unplugged_idle` |
+| `gun_state=2 output_state=0 errors=[]` | `plugged_idle` |
+| `gun_state=4 output_state=1 errors=[]` | `plugged_charging` |
+| `errors=[x]` | `error` |
+
 ## 🔧 Advanced Configuration
 
 Current defaults and operating behavior:
