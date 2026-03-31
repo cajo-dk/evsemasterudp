@@ -46,6 +46,17 @@ function readTemperature(buffer, offset) {
   return Math.round((raw - 20000) * 0.01 * 100) / 100;
 }
 
+function secondsSince(isoTimestamp) {
+  if (!isoTimestamp) {
+    return null;
+  }
+  const parsed = Date.parse(isoTimestamp);
+  if (Number.isNaN(parsed)) {
+    return null;
+  }
+  return Math.floor((Date.now() - parsed) / 1000);
+}
+
 function packDatagram({ serialHex, password, command, payload = Buffer.alloc(0), keyType = 0 }) {
   const totalLength = 25 + payload.length;
   const buffer = Buffer.alloc(totalLength);
@@ -135,6 +146,16 @@ class EVSEProxySession {
     this.lastStatusAt = null;
     this.lastChargeStatus = null;
     this.lastChargeStatusAt = null;
+    this.lastStatusPollRequestAt = null;
+    this.lastStatusPollResponseAt = null;
+    this.lastChargeStatusResponseAt = null;
+    this.statusPollCount = 0;
+    this.statusPollResponseCount = 0;
+    this.chargeStatusResponseCount = 0;
+    this.lastStatusPayloadSignature = null;
+    this.lastChargeStatusPayloadSignature = null;
+    this.lastStatusChangedAt = null;
+    this.lastChargeStatusChangedAt = null;
     this.authFailureReason = null;
     this.responseBuffer = [];
     this.keepAliveTimer = null;
@@ -151,9 +172,12 @@ class EVSEProxySession {
       metadata: 0,
     };
     this.discoveryPublished = false;
+    this.lastPublishedPayloads = {};
     this.connectPromise = null;
     this.chargingStateOverride = null;
     this.chargingStateOverrideTimer = null;
+    this.sessionHistory = [];
+    this.pollLoginInFlight = false;
   }
 
   log(message, details = null) {
@@ -274,6 +298,7 @@ class EVSEProxySession {
   }
 
   getDiagnostics() {
+    const freshness = this.buildProtocolFreshness();
     return {
       config: {
         ...this.config,
@@ -288,6 +313,17 @@ class EVSEProxySession {
       authFailureReason: this.authFailureReason,
       lastSeen: this.lastSeen,
       lastStatusAt: this.lastStatusAt,
+      protocol: {
+        lastStatusPollRequestAt: this.lastStatusPollRequestAt,
+        lastStatusPollResponseAt: this.lastStatusPollResponseAt,
+        lastChargeStatusResponseAt: this.lastChargeStatusResponseAt,
+        statusPollCount: this.statusPollCount,
+        statusPollResponseCount: this.statusPollResponseCount,
+        chargeStatusResponseCount: this.chargeStatusResponseCount,
+        lastStatusChangedAt: this.lastStatusChangedAt,
+        lastChargeStatusChangedAt: this.lastChargeStatusChangedAt,
+        ...freshness,
+      },
       metadata: {
         brand: this.evse.brand,
         model: this.evse.model,
@@ -298,6 +334,7 @@ class EVSEProxySession {
       },
       status: this.lastStatus,
       chargeStatus: this.lastChargeStatus,
+      sessionHistory: this.sessionHistory,
     };
   }
 
@@ -311,8 +348,12 @@ class EVSEProxySession {
       authFailureReason: this.authFailureReason,
       lastSeen: this.lastSeen,
       lastStatusAt: this.lastStatusAt,
+      lastStatusPollRequestAt: this.lastStatusPollRequestAt,
+      lastStatusPollResponseAt: this.lastStatusPollResponseAt,
+      lastChargeStatusResponseAt: this.lastChargeStatusResponseAt,
       status: this.lastStatus,
       chargeStatus: this.lastChargeStatus,
+      sessionHistory: this.sessionHistory,
     };
   }
 
@@ -451,6 +492,31 @@ class EVSEProxySession {
     return response;
   }
 
+  async refreshSessionForPoll() {
+    if (this.pollLoginInFlight) {
+      return this.loggedIn;
+    }
+    if (!this.config.serial || !this.config.password || !this.evse.ip || !this.evse.port) {
+      return false;
+    }
+
+    this.pollLoginInFlight = true;
+    try {
+      this.loggedIn = false;
+      const response = await this.loginOnce();
+      const ok = Boolean(response && response.command === COMMAND.LOGIN_RESPONSE);
+      this.loggedIn = ok;
+      if (ok) {
+        this.authFailureReason = null;
+      }
+      this.schedulePublish('health');
+      this.schedulePublish('diagnostics');
+      return ok;
+    } finally {
+      this.pollLoginInFlight = false;
+    }
+  }
+
   async sendHeading() {
     const heading = packDatagram({
       serialHex: this.config.serial,
@@ -467,6 +533,8 @@ class EVSEProxySession {
       return;
     }
 
+    this.lastStatusPollRequestAt = new Date().toISOString();
+    this.statusPollCount += 1;
     const request = packDatagram({
       serialHex: this.config.serial,
       password: this.config.password,
@@ -590,6 +658,21 @@ class EVSEProxySession {
     return 'unplugged_idle';
   }
 
+  buildProtocolFreshness() {
+    const statusAgeSeconds = secondsSince(this.lastStatusChangedAt);
+    const chargeStatusAgeSeconds = secondsSince(this.lastChargeStatusChangedAt);
+    const realtimeStatusStale = statusAgeSeconds !== null && statusAgeSeconds > 15;
+    const chargeStatusStale = chargeStatusAgeSeconds !== null && chargeStatusAgeSeconds > 15;
+
+    return {
+      statusAgeSeconds,
+      chargeStatusAgeSeconds,
+      realtimeStatusStale,
+      chargeStatusStale,
+      anyDataStale: Boolean(realtimeStatusStale || chargeStatusStale),
+    };
+  }
+
   currentChargeAmps() {
     const discoveredMax = Number(this.evse.maxElectricity) || 0;
     if (discoveredMax >= 6) {
@@ -696,9 +779,17 @@ class EVSEProxySession {
       if (!this.loggedIn) {
         return;
       }
-      this.requestStatusRefresh().catch((error) => {
-        this.error('Periodic status poll failed', error);
-      });
+      this.refreshSessionForPoll()
+        .then((ok) => {
+          if (!ok) {
+            this.error('Periodic poll login failed');
+            return;
+          }
+          return this.requestStatusRefresh();
+        })
+        .catch((error) => {
+          this.error('Periodic status poll failed', error);
+        });
     }, STATUS_POLL_INTERVAL_MS);
     this.log('Status poll loop started');
   }
@@ -811,16 +902,33 @@ class EVSEProxySession {
       }
 
       if (datagram.command === COMMAND.STATUS) {
+        const seenAt = new Date().toISOString();
+        const statusSignature = Buffer.from(datagram.payload).toString('hex');
         this.lastStatus = this.parseStatus(datagram.payload);
-        this.lastStatusAt = new Date().toISOString();
+        this.lastStatusAt = seenAt;
+        this.lastStatusPollResponseAt = seenAt;
+        this.statusPollResponseCount += 1;
+        if (this.lastStatusPayloadSignature !== statusSignature) {
+          this.lastStatusPayloadSignature = statusSignature;
+          this.lastStatusChangedAt = seenAt;
+        }
         this.log('Received EVSE status update', this.lastStatus);
         this.sendStatusAck().catch((error) => this.error('Status ACK failed', error));
         this.publishStatus().catch((error) => this.error('Publish status failed', error));
       }
 
       if (datagram.command === COMMAND.CHARGE_STATUS) {
+        const seenAt = new Date().toISOString();
+        const chargeStatusSignature = Buffer.from(datagram.payload).toString('hex');
         this.lastChargeStatus = this.parseChargeStatus(datagram.payload);
-        this.lastChargeStatusAt = new Date().toISOString();
+        this.lastChargeStatusAt = seenAt;
+        this.lastChargeStatusResponseAt = seenAt;
+        this.chargeStatusResponseCount += 1;
+        if (this.lastChargeStatusPayloadSignature !== chargeStatusSignature) {
+          this.lastChargeStatusPayloadSignature = chargeStatusSignature;
+          this.lastChargeStatusChangedAt = seenAt;
+        }
+        this.updateSessionHistory(this.lastChargeStatus, this.lastChargeStatusAt);
         this.log('Received EVSE charge status update', this.lastChargeStatus);
         this.sendChargeStatusAck().catch((error) => this.error('Charge status ACK failed', error));
         this.publishStatus().catch((error) => this.error('Publish status failed', error));
@@ -901,6 +1009,57 @@ class EVSEProxySession {
       feeType: payload[71],
       chargeFee: payload.readUInt16BE(72) * 0.01,
     };
+  }
+
+  buildSessionSnapshot(chargeStatus, seenAt = new Date().toISOString()) {
+    if (!chargeStatus) {
+      return null;
+    }
+
+    return {
+      chargeId: chargeStatus.chargeId || '',
+      sessionKey: chargeStatus.chargeId || `${chargeStatus.startDate}-${chargeStatus.port}`,
+      port: chargeStatus.port,
+      currentState: chargeStatus.currentState,
+      startType: chargeStatus.startType,
+      chargeType: chargeStatus.chargeType,
+      maxDurationMinutes: chargeStatus.maxDurationMinutes,
+      maxEnergyKwh: chargeStatus.maxEnergyKwh,
+      chargeParam3: chargeStatus.chargeParam3,
+      reservationDate: chargeStatus.reservationDate,
+      userId: chargeStatus.userId,
+      maxElectricity: chargeStatus.maxElectricity,
+      startDate: chargeStatus.startDate,
+      durationSeconds: chargeStatus.durationSeconds,
+      startKwhCounter: chargeStatus.startKwhCounter,
+      currentKwhCounter: chargeStatus.currentKwhCounter,
+      chargeKwh: chargeStatus.chargeKwh,
+      chargePrice: chargeStatus.chargePrice,
+      feeType: chargeStatus.feeType,
+      chargeFee: chargeStatus.chargeFee,
+      updatedAt: seenAt,
+    };
+  }
+
+  updateSessionHistory(chargeStatus, seenAt = new Date().toISOString()) {
+    const session = this.buildSessionSnapshot(chargeStatus, seenAt);
+    if (!session) {
+      return;
+    }
+
+    const index = this.sessionHistory.findIndex((item) => item.sessionKey === session.sessionKey);
+    if (index !== -1) {
+      this.sessionHistory[index] = {
+        ...this.sessionHistory[index],
+        ...session,
+      };
+      const [updated] = this.sessionHistory.splice(index, 1);
+      this.sessionHistory.unshift(updated);
+    } else {
+      this.sessionHistory.unshift(session);
+    }
+
+    this.sessionHistory = this.sessionHistory.slice(0, 10);
   }
 
   async sendStatusAck() {
@@ -1037,10 +1196,15 @@ class EVSEProxySession {
       return;
     }
 
+    const serializedPayload = JSON.stringify(payload);
+    if (this.lastPublishedPayloads[topic] === serializedPayload) {
+      return;
+    }
+
     await new Promise((resolve, reject) => {
       this.mqttClient.publish(
         topic,
-        JSON.stringify(payload),
+        serializedPayload,
         {
           qos: 1,
           retain: true,
@@ -1055,6 +1219,7 @@ class EVSEProxySession {
         },
       );
     });
+    this.lastPublishedPayloads[topic] = serializedPayload;
     this.log(`Published MQTT topic ${topic}`);
   }
 
@@ -1123,6 +1288,8 @@ class EVSEProxySession {
         unique_id: this.discoveryObjectId('energy_total'),
         state_topic: statusTopic,
         value_template: "{{ value_json.status.totalKwhCounter }}",
+        json_attributes_topic: statusTopic,
+        json_attributes_template: "{{ value_json.attributes.energyTotal | tojson }}",
         unit_of_measurement: 'kWh',
         device_class: 'energy',
         state_class: 'total_increasing',
@@ -1221,11 +1388,89 @@ class EVSEProxySession {
         device,
         ...commonAvailability,
       }],
+      ['sensor', 'charge_start_type', {
+        name: 'EVSE Charge Start Type',
+        unique_id: this.discoveryObjectId('charge_start_type'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.startType if value_json.chargeStatus is defined else '' }}",
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_type', {
+        name: 'EVSE Charge Type',
+        unique_id: this.discoveryObjectId('charge_type'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.chargeType if value_json.chargeStatus is defined else '' }}",
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_max_electricity', {
+        name: 'EVSE Charge Max Electricity',
+        unique_id: this.discoveryObjectId('charge_max_electricity'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.maxElectricity if value_json.chargeStatus is defined else '' }}",
+        unit_of_measurement: 'A',
+        device_class: 'current',
+        state_class: 'measurement',
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_price', {
+        name: 'EVSE Charge Price',
+        unique_id: this.discoveryObjectId('charge_price'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.chargePrice if value_json.chargeStatus is defined else '' }}",
+        icon: 'mdi:cash',
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_fee', {
+        name: 'EVSE Charge Fee',
+        unique_id: this.discoveryObjectId('charge_fee'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.chargeFee if value_json.chargeStatus is defined else '' }}",
+        icon: 'mdi:cash-plus',
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_user_id', {
+        name: 'EVSE Charge User ID',
+        unique_id: this.discoveryObjectId('charge_user_id'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.userId if value_json.chargeStatus is defined else '' }}",
+        icon: 'mdi:account',
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_start_kwh_counter', {
+        name: 'EVSE Charge Start kWh Counter',
+        unique_id: this.discoveryObjectId('charge_start_kwh_counter'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.startKwhCounter if value_json.chargeStatus is defined else '' }}",
+        unit_of_measurement: 'kWh',
+        device_class: 'energy',
+        state_class: 'measurement',
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_current_kwh_counter', {
+        name: 'EVSE Charge Current kWh Counter',
+        unique_id: this.discoveryObjectId('charge_current_kwh_counter'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.currentKwhCounter if value_json.chargeStatus is defined else '' }}",
+        unit_of_measurement: 'kWh',
+        device_class: 'energy',
+        state_class: 'measurement',
+        device,
+        ...commonAvailability,
+      }],
       ['sensor', 'evse_state', {
         name: 'EVSE State',
         unique_id: this.discoveryObjectId('evse_state'),
         state_topic: statusTopic,
         value_template: "{{ value_json.summary.evseState }}",
+        json_attributes_topic: statusTopic,
+        json_attributes_template: "{{ {'status': value_json.status, 'charge_status': value_json.chargeStatus, 'summary': value_json.summary, 'received_at': value_json.receivedAt, 'charge_received_at': value_json.chargeReceivedAt} | tojson }}",
         icon: 'mdi:ev-station',
         device,
         ...commonAvailability,
@@ -1379,6 +1624,7 @@ class EVSEProxySession {
   }
 
   async publishHealth() {
+    const freshness = this.buildProtocolFreshness();
     await this.publishJson(this.topicFor('health'), {
       serial: this.evse.serial,
       endpoint: this.evse.ip && this.evse.port ? `${this.evse.ip}:${this.evse.port}` : null,
@@ -1388,7 +1634,7 @@ class EVSEProxySession {
       authFailureReason: this.authFailureReason,
       lastSeen: this.lastSeen,
       lastStatusAt: this.lastStatusAt,
-      updatedAt: new Date().toISOString(),
+      protocol: freshness,
     });
   }
 
@@ -1406,7 +1652,6 @@ class EVSEProxySession {
       maxPower: this.evse.maxPower,
       maxElectricity: this.evse.maxElectricity,
       hotline: this.evse.hotline,
-      updatedAt: new Date().toISOString(),
     });
   }
 
@@ -1414,6 +1659,7 @@ class EVSEProxySession {
     if (!this.lastStatus && !this.lastChargeStatus) {
       return;
     }
+    const freshness = this.buildProtocolFreshness();
     await this.publishJson(this.topicFor('status'), {
       serial: this.evse.serial,
       endpoint: this.evse.ip && this.evse.port ? `${this.evse.ip}:${this.evse.port}` : null,
@@ -1424,6 +1670,22 @@ class EVSEProxySession {
         pluggedIn: this.isPluggedIn(this.lastStatus, this.lastChargeStatus),
         charging: this.effectiveChargingState(this.lastStatus, this.lastChargeStatus),
         hasError: Boolean(this.lastStatus && this.lastStatus.errorBits),
+      },
+      protocol: {
+        lastStatusPollRequestAt: this.lastStatusPollRequestAt,
+        lastStatusPollResponseAt: this.lastStatusPollResponseAt,
+        lastChargeStatusResponseAt: this.lastChargeStatusResponseAt,
+        statusPollCount: this.statusPollCount,
+        statusPollResponseCount: this.statusPollResponseCount,
+        chargeStatusResponseCount: this.chargeStatusResponseCount,
+        lastStatusChangedAt: this.lastStatusChangedAt,
+        lastChargeStatusChangedAt: this.lastChargeStatusChangedAt,
+        ...freshness,
+      },
+      attributes: {
+        energyTotal: {
+          last_10_sessions: this.sessionHistory,
+        },
       },
       status: this.lastStatus,
       chargeStatus: this.lastChargeStatus,
