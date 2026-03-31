@@ -5,18 +5,24 @@ const mqtt = require('mqtt');
 const SETTINGS_KEY = 'proxyConfig';
 const APP_VERSION = '0.1.0';
 const LISTEN_PORT = 28376;
+const KEEPALIVE_INTERVAL_MS = 20000;
+const STATUS_POLL_INTERVAL_MS = 5000;
+const STATUS_PUBLISH_INTERVAL_MS = 5000;
 const COMMAND = {
   LOGIN_BROADCAST: 0x0001,
   LOGIN_RESPONSE: 0x0002,
   HEADING: 0x0003,
   STATUS: 0x0004,
+  CHARGE_STATUS: 0x0005,
   CHARGE_START_RESPONSE: 0x0007,
   CHARGE_STOP_RESPONSE: 0x0008,
+  REQUEST_STATUS_RECORD: 0x000d,
   PASSWORD_ERROR: 0x0155,
   LOGIN_CONFIRM: 0x8001,
   REQUEST_LOGIN: 0x8002,
   HEADING_RESPONSE: 0x8003,
   STATUS_RESPONSE: 0x8004,
+  CHARGE_STATUS_ACK: 0x800d,
   CHARGE_START: 0x8007,
   CHARGE_STOP: 0x8008,
 };
@@ -127,9 +133,13 @@ class EVSEProxySession {
     this.lastSeen = null;
     this.lastStatus = null;
     this.lastStatusAt = null;
+    this.lastChargeStatus = null;
+    this.lastChargeStatusAt = null;
     this.authFailureReason = null;
     this.responseBuffer = [];
     this.keepAliveTimer = null;
+    this.statusPollTimer = null;
+    this.statusPublishTimer = null;
     this.publishTimers = {
       health: null,
       diagnostics: null,
@@ -209,6 +219,8 @@ class EVSEProxySession {
 
   async stop() {
     this.clearKeepAlive();
+    this.clearStatusPoll();
+    this.clearStatusPublisher();
     this.clearPublishTimers();
     await this.stopMqtt();
     if (!this.socket) {
@@ -285,6 +297,7 @@ class EVSEProxySession {
         hotline: this.evse.hotline,
       },
       status: this.lastStatus,
+      chargeStatus: this.lastChargeStatus,
     };
   }
 
@@ -299,6 +312,7 @@ class EVSEProxySession {
       lastSeen: this.lastSeen,
       lastStatusAt: this.lastStatusAt,
       status: this.lastStatus,
+      chargeStatus: this.lastChargeStatus,
     };
   }
 
@@ -341,6 +355,8 @@ class EVSEProxySession {
     if (!loginResponse || loginResponse.command !== COMMAND.LOGIN_RESPONSE) {
       this.loggedIn = false;
       this.clearKeepAlive();
+      this.clearStatusPoll();
+      this.clearStatusPublisher();
       this.log('EVSE login failed', {
         reason: this.authFailureReason,
         endpoint: this.evse.ip && this.evse.port ? `${this.evse.ip}:${this.evse.port}` : null,
@@ -354,7 +370,10 @@ class EVSEProxySession {
     this.authFailureReason = null;
     this.log(`EVSE login succeeded at ${this.evse.ip}:${this.evse.port}`);
     await this.sendHeading();
+    await this.requestStatusRefresh();
     this.startKeepAlive();
+    this.startStatusPoll();
+    this.startStatusPublisher();
     this.schedulePublish('health');
     this.schedulePublish('diagnostics');
     this.schedulePublish('metadata');
@@ -367,8 +386,9 @@ class EVSEProxySession {
       this.log('Refresh requested while disconnected; reconnecting first');
       await this.connect();
     } else {
-      this.log('Refresh requested; sending heading');
+      this.log('Refresh requested; sending heading and status request');
       await this.sendHeading();
+      await this.requestStatusRefresh();
     }
 
     await sleep(250);
@@ -442,6 +462,21 @@ class EVSEProxySession {
     this.log('Heading sent to EVSE');
   }
 
+  async requestStatusRefresh() {
+    if (!this.config.serial || !this.config.password || !this.evse.ip || !this.evse.port) {
+      return;
+    }
+
+    const request = packDatagram({
+      serialHex: this.config.serial,
+      password: this.config.password,
+      command: COMMAND.REQUEST_STATUS_RECORD,
+      payload: Buffer.alloc(0),
+    });
+    await this.sendToEvse(request);
+    this.log('Requested EVSE status refresh');
+  }
+
   normalizeChargingCommand(payload) {
     const value = String(payload || '').trim().toLowerCase();
     if (['1', 'on', 'true', 'start', 'charging'].includes(value)) {
@@ -453,20 +488,26 @@ class EVSEProxySession {
     return null;
   }
 
-  isPluggedIn(status = this.lastStatus) {
-    if (!status) {
+  isPluggedIn(status = this.lastStatus, chargeStatus = this.lastChargeStatus) {
+    if (status) {
+      return [2, 3, 4].includes(status.gunState)
+        || [13, 14, 15, 17, 20].includes(status.currentState)
+        || status.outputState === 1;
+    }
+    if (!chargeStatus) {
       return false;
     }
-    // Field observations show gunState=2 can still mean unplugged/idle on some units.
-    // Treat only the higher states as truly plugged to avoid false positives.
-    return [3, 4].includes(status.gunState);
+    return [13, 14, 15, 17, 20].includes(chargeStatus.currentState);
   }
 
-  isCharging(status = this.lastStatus) {
-    if (!status) {
+  isCharging(status = this.lastStatus, chargeStatus = this.lastChargeStatus) {
+    if (status) {
+      return status.outputState === 1;
+    }
+    if (!chargeStatus) {
       return false;
     }
-    return status.outputState === 1;
+    return chargeStatus.currentState === 14;
   }
 
   hasRecentEvseTraffic(maxAgeMs = 180000) {
@@ -514,8 +555,8 @@ class EVSEProxySession {
     }, timeoutMs);
   }
 
-  effectiveChargingState(status = this.lastStatus) {
-    const actualCharging = this.isCharging(status);
+  effectiveChargingState(status = this.lastStatus, chargeStatus = this.lastChargeStatus) {
+    const actualCharging = this.isCharging(status, chargeStatus);
     if (!this.chargingStateOverride) {
       return actualCharging;
     }
@@ -533,17 +574,17 @@ class EVSEProxySession {
     return actualCharging;
   }
 
-  deriveEvseState(status = this.lastStatus) {
-    if (!status) {
-      return this.loggedIn ? 'unknown' : 'disconnected';
-    }
-    if (status.errorBits) {
+  deriveEvseState(status = this.lastStatus, chargeStatus = this.lastChargeStatus) {
+    if (status && status.errorBits) {
       return 'error';
     }
-    if (this.effectiveChargingState(status)) {
+    if (!status && !chargeStatus) {
+      return this.loggedIn ? 'unknown' : 'disconnected';
+    }
+    if (this.effectiveChargingState(status, chargeStatus)) {
       return 'plugged_charging';
     }
-    if (this.isPluggedIn(status)) {
+    if (this.isPluggedIn(status, chargeStatus)) {
       return 'plugged_idle';
     }
     return 'unplugged_idle';
@@ -613,8 +654,12 @@ class EVSEProxySession {
     }
 
     if (!this.loggedIn) {
-      this.log('Ignoring stop command because EVSE is not logged in');
-      return;
+      this.log('Stop requested while disconnected; reconnecting first');
+      await this.connect();
+      if (!this.loggedIn) {
+        this.log('Unable to reconnect to EVSE for stop command');
+        return;
+      }
     }
     await this.sendChargeStop();
     this.setChargingStateOverride(false);
@@ -630,7 +675,10 @@ class EVSEProxySession {
         return;
       }
       this.sendHeading().catch((error) => this.error('Keepalive failed', error));
-    }, 20000);
+      this.requestStatusRefresh().catch((error) => {
+        this.error('Status refresh request failed', error);
+      });
+    }, KEEPALIVE_INTERVAL_MS);
     this.log('Keepalive loop started');
   }
 
@@ -639,6 +687,45 @@ class EVSEProxySession {
       this.homey.clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
       this.log('Keepalive loop stopped');
+    }
+  }
+
+  startStatusPoll() {
+    this.clearStatusPoll();
+    this.statusPollTimer = this.homey.setInterval(() => {
+      if (!this.loggedIn) {
+        return;
+      }
+      this.requestStatusRefresh().catch((error) => {
+        this.error('Periodic status poll failed', error);
+      });
+    }, STATUS_POLL_INTERVAL_MS);
+    this.log('Status poll loop started');
+  }
+
+  clearStatusPoll() {
+    if (this.statusPollTimer) {
+      this.homey.clearInterval(this.statusPollTimer);
+      this.statusPollTimer = null;
+      this.log('Status poll loop stopped');
+    }
+  }
+
+  startStatusPublisher() {
+    this.clearStatusPublisher();
+    this.statusPublishTimer = this.homey.setInterval(() => {
+      this.publishHealth().catch((error) => this.error('Periodic health publish failed', error));
+      this.publishDiagnostics().catch((error) => this.error('Periodic diagnostics publish failed', error));
+      this.publishStatus().catch((error) => this.error('Periodic status publish failed', error));
+    }, STATUS_PUBLISH_INTERVAL_MS);
+    this.log('Status publisher loop started');
+  }
+
+  clearStatusPublisher() {
+    if (this.statusPublishTimer) {
+      this.homey.clearInterval(this.statusPublishTimer);
+      this.statusPublishTimer = null;
+      this.log('Status publisher loop stopped');
     }
   }
 
@@ -731,6 +818,14 @@ class EVSEProxySession {
         this.publishStatus().catch((error) => this.error('Publish status failed', error));
       }
 
+      if (datagram.command === COMMAND.CHARGE_STATUS) {
+        this.lastChargeStatus = this.parseChargeStatus(datagram.payload);
+        this.lastChargeStatusAt = new Date().toISOString();
+        this.log('Received EVSE charge status update', this.lastChargeStatus);
+        this.sendChargeStatusAck().catch((error) => this.error('Charge status ACK failed', error));
+        this.publishStatus().catch((error) => this.error('Publish status failed', error));
+      }
+
       this.schedulePublish('health');
       this.schedulePublish('diagnostics');
     }
@@ -769,6 +864,45 @@ class EVSEProxySession {
     };
   }
 
+  parseChargeStatus(payload) {
+    if (payload.length < 74) {
+      return null;
+    }
+
+    const currentState = (payload.length <= 74 || ![18, 19].includes(payload[74]))
+      ? payload[1]
+      : payload[74];
+
+    const readAscii = (start, length) => payload.subarray(start, start + length)
+      .toString('ascii')
+      .replace(/\x00+$/, '');
+    const maxDurationRaw = payload.readUInt16BE(20);
+    const maxEnergyRaw = payload.readUInt16BE(22);
+    const param3Raw = payload.readUInt16BE(24);
+
+    return {
+      port: payload[0],
+      currentState,
+      chargeId: readAscii(2, 16),
+      startType: payload[18],
+      chargeType: payload[19],
+      maxDurationMinutes: maxDurationRaw === 0xffff ? null : maxDurationRaw,
+      maxEnergyKwh: maxEnergyRaw === 0xffff ? null : maxEnergyRaw * 0.01,
+      chargeParam3: param3Raw === 0xffff ? null : param3Raw * 0.01,
+      reservationDate: payload.readUInt32BE(26),
+      userId: readAscii(30, 16),
+      maxElectricity: payload[46],
+      startDate: payload.readUInt32BE(47),
+      durationSeconds: payload.readUInt32BE(51),
+      startKwhCounter: payload.readUInt32BE(55) * 0.01,
+      currentKwhCounter: payload.readUInt32BE(59) * 0.01,
+      chargeKwh: payload.readUInt32BE(63) * 0.01,
+      chargePrice: payload.readUInt32BE(67) * 0.01,
+      feeType: payload[71],
+      chargeFee: payload.readUInt16BE(72) * 0.01,
+    };
+  }
+
   async sendStatusAck() {
     if (!this.config.serial || !this.config.password || !this.evse.ip || !this.evse.port) {
       return;
@@ -781,6 +915,20 @@ class EVSEProxySession {
     });
     await this.sendToEvse(ack);
     this.log('Sent status ACK to EVSE');
+  }
+
+  async sendChargeStatusAck() {
+    if (!this.config.serial || !this.config.password || !this.evse.ip || !this.evse.port) {
+      return;
+    }
+    const ack = packDatagram({
+      serialHex: this.config.serial,
+      password: this.config.password,
+      command: COMMAND.CHARGE_STATUS_ACK,
+      payload: Buffer.from([0x00]),
+    });
+    await this.sendToEvse(ack);
+    this.log('Sent charge status ACK to EVSE');
   }
 
   async restartMqtt() {
@@ -1035,6 +1183,44 @@ class EVSEProxySession {
         device,
         ...commonAvailability,
       }],
+      ['sensor', 'charge_state', {
+        name: 'EVSE Charge State',
+        unique_id: this.discoveryObjectId('charge_state'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.currentState if value_json.chargeStatus is defined else '' }}",
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_kwh', {
+        name: 'EVSE Charge kWh',
+        unique_id: this.discoveryObjectId('charge_kwh'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.chargeKwh if value_json.chargeStatus is defined else '' }}",
+        unit_of_measurement: 'kWh',
+        device_class: 'energy',
+        state_class: 'measurement',
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_duration_seconds', {
+        name: 'EVSE Charge Duration Seconds',
+        unique_id: this.discoveryObjectId('charge_duration_seconds'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.durationSeconds if value_json.chargeStatus is defined else '' }}",
+        unit_of_measurement: 's',
+        icon: 'mdi:timer-outline',
+        device,
+        ...commonAvailability,
+      }],
+      ['sensor', 'charge_id', {
+        name: 'EVSE Charge ID',
+        unique_id: this.discoveryObjectId('charge_id'),
+        state_topic: statusTopic,
+        value_template: "{{ value_json.chargeStatus.chargeId if value_json.chargeStatus is defined else '' }}",
+        icon: 'mdi:identifier',
+        device,
+        ...commonAvailability,
+      }],
       ['sensor', 'evse_state', {
         name: 'EVSE State',
         unique_id: this.discoveryObjectId('evse_state'),
@@ -1225,20 +1411,22 @@ class EVSEProxySession {
   }
 
   async publishStatus() {
-    if (!this.lastStatus) {
+    if (!this.lastStatus && !this.lastChargeStatus) {
       return;
     }
     await this.publishJson(this.topicFor('status'), {
       serial: this.evse.serial,
       endpoint: this.evse.ip && this.evse.port ? `${this.evse.ip}:${this.evse.port}` : null,
       receivedAt: this.lastStatusAt,
+      chargeReceivedAt: this.lastChargeStatusAt,
       summary: {
-        evseState: this.deriveEvseState(this.lastStatus),
-        pluggedIn: this.isPluggedIn(this.lastStatus),
-        charging: this.effectiveChargingState(this.lastStatus),
-        hasError: Boolean(this.lastStatus.errorBits),
+        evseState: this.deriveEvseState(this.lastStatus, this.lastChargeStatus),
+        pluggedIn: this.isPluggedIn(this.lastStatus, this.lastChargeStatus),
+        charging: this.effectiveChargingState(this.lastStatus, this.lastChargeStatus),
+        hasError: Boolean(this.lastStatus && this.lastStatus.errorBits),
       },
       status: this.lastStatus,
+      chargeStatus: this.lastChargeStatus,
     });
   }
 }

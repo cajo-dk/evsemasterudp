@@ -12,9 +12,12 @@ from .datagram import Datagram, parse_datagrams
 from .datagrams import (
     RequestLogin, LoginConfirm, PasswordErrorResponse, 
     Heading, HeadingResponse, SingleACStatus, SingleACStatusResponse,
-    CurrentChargeRecord, RequestChargeStatusRecord, ChargeStart, ChargeStop,
+    CurrentChargeRecord, CurrentChargeRecordResponse, RequestChargeStatusRecord,
+    RequestStatusRecord,
+    ChargeStart, ChargeStop, ChargeStartResponse, ChargeStopResponse,
     SetAndGetOutputElectricity, SetAndGetOutputElectricityResponse,
-    Login, LoginResponse, SingleACChargingStatusPublicAuto, SingleACChargingStatusResponse
+    Login, LoginResponse, SingleACChargingStatusPublicAuto,
+    SetAndGetSystemTime, SetAndGetSystemTimeResponse
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -110,6 +113,13 @@ class EVSE:
         self._last_response = None  # To wait for authentication responses
         self._response_buffer: List[Datagram] = []
         self.auth_failure_reason: Optional[str] = None
+        self.last_status_update: Optional[datetime] = None
+        self.last_charge_status_update: Optional[datetime] = None
+        self.last_charge_record_update: Optional[datetime] = None
+        self.last_poll_request: Optional[datetime] = None
+        self.last_poll_response: Optional[datetime] = None
+        self.last_status_poll_request: Optional[datetime] = None
+        self.poll_failures: int = 0
         
         # Possible states according to the protocol
         self.GUN_STATES = {
@@ -147,6 +157,24 @@ class EVSE:
     def is_logged_in(self) -> bool:
         """Check if logged in to the EVSE"""
         return self._logged_in and self.is_online()
+
+    def get_latest_charge_update(self) -> Optional[datetime]:
+        """Return the freshest charging-session timestamp we have."""
+        timestamps = [
+            ts for ts in (self.last_charge_status_update, self.last_charge_record_update) if ts
+        ]
+        return max(timestamps) if timestamps else None
+
+    def is_charge_data_stale(self, threshold_seconds: int = 20) -> bool:
+        """Return True when charge/session data appears stale despite connectivity."""
+        if not self.is_logged_in():
+            return False
+
+        latest_update = self.get_latest_charge_update()
+        if latest_update is None:
+            return self.last_poll_request is not None
+
+        return (datetime.now() - latest_update).total_seconds() > threshold_seconds
     
     def get_meta_state(self) -> str:
         """Get the meta state of the EVSE"""
@@ -263,11 +291,6 @@ class EVSE:
         self.last_active_login = datetime.now()
         _LOGGER.info(f"Connection established with {self.info.serial}")
 
-        try:
-            await self._fetch_config()
-        except Exception as e:
-            _LOGGER.warning(f"Unable to retrieve config for {self.info.serial}: {e}")
-
         return response
 
     async def _wait_for_endpoint_change(self, ip: str, port: int, timeout: float = 5.0) -> bool:
@@ -294,15 +317,6 @@ class EVSE:
         
         return None
     
-    async def _fetch_config(self):
-        """Fetch the EVSE configuration"""
-        # Send a status request to retrieve data
-        heading = Heading()
-        heading.set_device_serial(self.info.serial)
-        heading.set_device_password(self.password)
-        await self.send_datagram(heading)
-        _LOGGER.debug(f"Configuration request sent to {self.info.serial}")
-    
     async def charge_start(self, max_amps: int = 6, single_phase: bool = False, 
                           user_id: str = "", charge_id: str = "") -> bool:
         """Start charging"""
@@ -326,7 +340,12 @@ class EVSE:
                 charge_start.set_charge_id(f"{int(time.time())}")
             
             await self.send_datagram(charge_start)
-            _LOGGER.info(f"Charge command sent: {max_amps}A")
+            response = await self._wait_for_response([ChargeStartResponse.COMMAND], 5.0)
+            if not response:
+                _LOGGER.error(f"No ChargeStartResponse from {self.info.serial}")
+                return False
+
+            _LOGGER.info(f"Charge start confirmed: {max_amps}A")
             return True
             
         except Exception as e:
@@ -345,7 +364,12 @@ class EVSE:
             charge_stop.user_id = user_id
             
             await self.send_datagram(charge_stop)
-            _LOGGER.info("Charge stop command sent")
+            response = await self._wait_for_response([ChargeStopResponse.COMMAND], 5.0)
+            if not response:
+                _LOGGER.error(f"No ChargeStopResponse from {self.info.serial}")
+                return False
+
+            _LOGGER.info("Charge stop confirmed")
             return True
             
         except Exception as e:
@@ -395,15 +419,10 @@ class EVSE:
             raise RuntimeError("Not connected to the EVSE")
         
         try:
-            # TODO: Reimplement SetAndGetNickName
-            # set_name = SetAndGetNickName()
-            # set_name.set_device_serial(self.info.serial)
-            # set_name.set_device_password(self.password)
-            # set_name.name = name
-            # await self.send_datagram(set_name)
-            # self.config.name = name
-            _LOGGER.info(f"Name configuration to be implemented: {name}")
-            return True
+            _LOGGER.warning(
+                f"Name configuration is not implemented for {self.info.serial}: {name}"
+            )
+            return False
             
         except Exception as e:
             _LOGGER.error(f"Error while setting name: {e}")
@@ -415,12 +434,17 @@ class EVSE:
             raise RuntimeError("Not connected to the EVSE")
         
         try:
-            # TODO: Reimplement SetAndGetSystemTime
-            # sync_time = SetAndGetSystemTime()
-            # sync_time.set_device_serial(self.info.serial)
-            # sync_time.set_device_password(self.password)
-            # await self.send_datagram(sync_time)
-            _LOGGER.info("Time synchronization to be implemented")
+            sync_time = SetAndGetSystemTime()
+            sync_time.set_device_serial(self.info.serial)
+            sync_time.set_device_password(self.password)
+            await self.send_datagram(sync_time)
+
+            response = await self._wait_for_response([SetAndGetSystemTimeResponse.COMMAND], 5.0)
+            if not response:
+                _LOGGER.error(f"No SetAndGetSystemTimeResponse from {self.info.serial}")
+                return False
+
+            _LOGGER.info(f"Time synchronization confirmed for {self.info.serial}")
             return True
             
         except Exception as e:
@@ -437,6 +461,9 @@ class Communicator:
         self.evses: Dict[str, EVSE] = {}
         self.callbacks: Dict[str, Callable] = {}
         self._periodic_task: Optional[asyncio.Task] = None
+        self.poll_interval_seconds = 5
+        self.relogin_interval_seconds = 30
+        self.charge_data_stale_seconds = 20
     
     async def start(self) -> int:
         """Start the communicator"""
@@ -592,6 +619,7 @@ class Communicator:
         """Handle an AC status"""
         if not evse.state:
             evse.state = EVSEState()
+        evse.last_status_update = datetime.now()
         
         # Copy data from SingleACStatus to EVSEState
         evse.state.current_power = datagram.current_power
@@ -619,6 +647,9 @@ class Communicator:
     async def _handle_charging_status(self, evse: EVSE, datagram: SingleACChargingStatusPublicAuto):
         """Handle automatic AC charging status (command 0x0005)"""
         _LOGGER.debug(f"Charge status received for {evse.info.serial}")
+        evse.last_charge_status_update = datetime.now()
+        evse.last_poll_response = evse.last_charge_status_update
+        evse.poll_failures = 0
         # Update charge information if available
         if not evse.current_charge:
             evse.current_charge = EVSECurrentCharge()
@@ -638,7 +669,7 @@ class Communicator:
         evse.current_charge.charge_price = datagram.charge_price
         evse.current_charge.charge_fee = datagram.charge_fee
         # Send acknowledgment (as in TypeScript)
-        response = SingleACChargingStatusResponse()
+        response = CurrentChargeRecordResponse()
         response.set_device_serial(evse.info.serial)
         response.set_device_password(evse.password)
         await evse.send_datagram(response)
@@ -658,6 +689,9 @@ class Communicator:
         """Handle a charge record"""
         if not evse.current_charge:
             evse.current_charge = EVSECurrentCharge()
+        evse.last_charge_record_update = datetime.now()
+        evse.last_poll_response = evse.last_charge_record_update
+        evse.poll_failures = 0
         
         # Map protocol attributes to internal structure
         evse.current_charge.port = datagram.line_id  # line_id → port
@@ -724,23 +758,45 @@ class Communicator:
         """Periodic checks"""
         while self.running:
             try:
-                await asyncio.sleep(5)
+                await asyncio.sleep(self.poll_interval_seconds)
                 
-                for evse in self.evses.values():
-                    # Check if we need to reconnect
-                    if evse.is_logged_in() and evse.last_active_login:
-                        time_since_login = datetime.now() - evse.last_active_login
-                        if time_since_login.total_seconds() > 30:
-                            # Relaunch login
-                            if evse.password:
-                                await evse.login(evse.password)
-                    
-                    # Request status regularly
-                    if evse.is_logged_in():
-                        await evse.send_datagram(RequestChargeStatusRecord())
+                for evse in list(self.evses.values()):
+                    await self._maintain_evse(evse)
                 
             except Exception as e:
                 _LOGGER.error(f"Error in periodic checks: {e}")
+
+    async def _maintain_evse(self, evse: EVSE):
+        """Run one maintenance cycle for an EVSE."""
+        if evse.is_logged_in() and evse.last_active_login:
+            time_since_login = datetime.now() - evse.last_active_login
+            if time_since_login.total_seconds() > self.relogin_interval_seconds and evse.password:
+                await evse.login(evse.password)
+                return
+
+        if evse.is_logged_in():
+            await self._poll_realtime_status(evse)
+            await self._poll_charge_status(evse)
+
+    async def _poll_charge_status(self, evse: EVSE):
+        """Request a fresh charge/session record and track staleness."""
+        prior_poll = evse.last_poll_request
+        latest_update = evse.get_latest_charge_update()
+        if prior_poll and (
+            latest_update is None or (latest_update <= prior_poll)
+        ):
+            evse.poll_failures += 1
+
+        evse.last_poll_request = datetime.now()
+        await evse.send_datagram(RequestChargeStatusRecord())
+
+        if evse.is_charge_data_stale(self.charge_data_stale_seconds):
+            await self._notify_callbacks('evse_charge_data_stale', evse)
+
+    async def _poll_realtime_status(self, evse: EVSE):
+        """Request a fresh real-time status frame for gun/output state."""
+        evse.last_status_poll_request = datetime.now()
+        await evse.send_datagram(RequestStatusRecord())
     
     async def _notify_callbacks(self, event: str, evse: EVSE):
         """Notify callbacks"""

@@ -114,6 +114,8 @@ class Datagram(ABC):
             raise ValueError("Missing magic header")
         
         length = struct.unpack('>H', buffer[2:4])[0]
+        if length < 25:
+            raise ValueError("Invalid length")
         if length > len(buffer):
             raise ValueError("Invalid length")
         
@@ -122,6 +124,10 @@ class Datagram(ABC):
         checksum = struct.unpack('>H', buffer[length-4:length-2])[0]
         if computed_checksum != checksum:
             raise ValueError("Invalid checksum")
+
+        tail = struct.unpack('>H', buffer[length-2:length])[0]
+        if tail != self.PACKET_TAIL:
+            raise ValueError("Invalid tail")
         
         return length - 25
     

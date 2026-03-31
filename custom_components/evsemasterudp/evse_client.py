@@ -70,6 +70,13 @@ class EVSEClient:
             'online': evse.is_online(),
             'logged_in': evse.is_logged_in(),
             'state': evse.get_meta_state(),
+            'last_status_update': evse.last_status_update,
+            'last_charge_status_update': evse.last_charge_status_update,
+            'last_charge_record_update': evse.last_charge_record_update,
+            'last_poll_request': evse.last_poll_request,
+            'last_poll_response': evse.last_poll_response,
+            'charge_data_stale': evse.is_charge_data_stale(),
+            'poll_failures': evse.poll_failures,
             
             # EVSE information
             'brand': evse.info.brand,
@@ -90,6 +97,7 @@ class EVSEClient:
         if evse.state:
             data.update({
                 'current_power': evse.state.current_power,
+                'energy_total_kwh': evse.state.current_amount,
                 'voltage_l1': evse.state.l1_voltage,
                 'voltage_l2': evse.state.l2_voltage,
                 'voltage_l3': evse.state.l3_voltage,
@@ -106,6 +114,7 @@ class EVSEClient:
             # Default values if no state
             data.update({
                 'current_power': 0,
+                'energy_total_kwh': 0,
                 'voltage_l1': 0,
                 'voltage_l2': 0,
                 'voltage_l3': 0,

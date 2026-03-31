@@ -6,11 +6,13 @@ Basic EVSE protocol sanity tests.
 import asyncio
 import os
 import sys
+from datetime import datetime, timedelta
 
 
 test_dir = os.path.dirname(__file__)
 project_root = os.path.dirname(test_dir)
 evse_module_path = os.path.join(project_root, "custom_components", "evsemasterudp")
+sys.path.insert(0, project_root)
 sys.path.insert(0, evse_module_path)
 
 
@@ -66,6 +68,30 @@ async def test_datagram_packing():
         packed = login.pack()
         print(f"  OK Datagram encoded ({len(packed)} bytes)")
         print(f"     Hex: {packed.hex()}")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_datagram_invalid_tail_rejected():
+    """Packets with a wrong tail marker must be rejected."""
+    try:
+        print("Testing invalid tail rejection...")
+
+        from protocol.datagram import parse_datagrams
+        from protocol.datagrams import RequestLogin
+
+        login = RequestLogin()
+        login.set_device_serial("1368844619649410")
+        login.set_device_password("123456")
+        packed = bytearray(login.pack())
+        packed[-1] ^= 0x01
+
+        parsed = parse_datagrams(bytes(packed))
+        if parsed:
+            return False, "invalid-tail packet was accepted"
+
+        print("  OK Invalid tail was rejected")
         return True, None
     except Exception as e:
         return False, str(e)
@@ -275,6 +301,314 @@ async def test_login_failure_reason():
         return False, str(e)
 
 
+async def test_charge_status_ack_uses_0x800d():
+    """Charge status updates should be acknowledged with 0x800d."""
+    try:
+        print("Testing charge status ACK opcode...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import CurrentChargeRecordResponse, SingleACChargingStatusPublicAuto
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.password = "123456"
+        sent = []
+
+        async def fake_send(datagram, target_evse):
+            sent.append((datagram.get_command(), datagram.__class__.__name__))
+            return 0
+
+        comm.send = fake_send
+
+        datagram = SingleACChargingStatusPublicAuto()
+        datagram.set_device_serial(evse.info.serial)
+        datagram.unpack_payload(bytes(74))
+        await comm._handle_charging_status(evse, datagram)
+
+        if not sent:
+            return False, "no ACK was sent"
+        if sent[0][0] != CurrentChargeRecordResponse.COMMAND:
+            return False, f"expected ACK 0x{CurrentChargeRecordResponse.COMMAND:04x}, got 0x{sent[0][0]:04x}"
+
+        print("  OK Charge status ACK uses 0x800d")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_charge_start_waits_for_confirmation():
+    """Charge start should only succeed after a response is received."""
+    try:
+        print("Testing charge start confirmation...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import ChargeStart, ChargeStartResponse
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.password = "123456"
+        evse._logged_in = True
+        sent = []
+
+        async def fake_send_datagram(datagram):
+            sent.append(datagram.get_command())
+            if isinstance(datagram, ChargeStart):
+                response = ChargeStartResponse()
+                response.set_device_serial(evse.info.serial)
+                await comm._process_datagram(response, (evse.info.ip, evse.info.port))
+            return 0
+
+        evse.send_datagram = fake_send_datagram
+        ok = await evse.charge_start(16)
+
+        if not ok:
+            return False, "charge start did not wait for the response"
+        if ChargeStart.COMMAND not in sent:
+            return False, "charge start command was not sent"
+
+        print("  OK Charge start waits for confirmation")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_charge_stop_waits_for_confirmation():
+    """Charge stop should only succeed after a response is received."""
+    try:
+        print("Testing charge stop confirmation...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import ChargeStop, ChargeStopResponse
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.password = "123456"
+        evse._logged_in = True
+        sent = []
+
+        async def fake_send_datagram(datagram):
+            sent.append(datagram.get_command())
+            if isinstance(datagram, ChargeStop):
+                response = ChargeStopResponse()
+                response.set_device_serial(evse.info.serial)
+                await comm._process_datagram(response, (evse.info.ip, evse.info.port))
+            return 0
+
+        evse.send_datagram = fake_send_datagram
+        ok = await evse.charge_stop()
+
+        if not ok:
+            return False, "charge stop did not wait for the response"
+        if ChargeStop.COMMAND not in sent:
+            return False, "charge stop command was not sent"
+
+        print("  OK Charge stop waits for confirmation")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_sync_time_waits_for_confirmation():
+    """System time sync should wait for its protocol response."""
+    try:
+        print("Testing time sync confirmation...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import SetAndGetSystemTime, SetAndGetSystemTimeResponse
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.password = "123456"
+        evse._logged_in = True
+        sent = []
+
+        async def fake_send_datagram(datagram):
+            sent.append(datagram.get_command())
+            if isinstance(datagram, SetAndGetSystemTime):
+                response = SetAndGetSystemTimeResponse()
+                response.set_device_serial(evse.info.serial)
+                await comm._process_datagram(response, (evse.info.ip, evse.info.port))
+            return 0
+
+        evse.send_datagram = fake_send_datagram
+        ok = await evse.sync_time()
+
+        if not ok:
+            return False, "time sync did not wait for the response"
+        if SetAndGetSystemTime.COMMAND not in sent:
+            return False, "time sync command was not sent"
+
+        print("  OK Time sync waits for confirmation")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_charge_data_stale_detection():
+    """Charge/session freshness should be tracked separately from connectivity."""
+    try:
+        print("Testing charge data staleness...")
+
+        from protocol.communicator import Communicator
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse._logged_in = True
+        evse.last_seen = datetime.now()
+        evse.last_poll_request = datetime.now()
+
+        if not evse.is_charge_data_stale():
+            return False, "missing charge data after polling should be stale"
+
+        evse.last_charge_record_update = datetime.now()
+        if evse.is_charge_data_stale():
+            return False, "fresh charge data should not be stale"
+
+        evse.last_charge_record_update = datetime.now() - timedelta(seconds=25)
+        if not evse.is_charge_data_stale():
+            return False, "old charge data should be stale"
+
+        print("  OK Charge data staleness is tracked")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_polling_tracks_failures_and_requests():
+    """Polling should record requests and increment failures for missed responses."""
+    try:
+        print("Testing poll tracking...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import RequestChargeStatusRecord
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.password = "123456"
+        evse._logged_in = True
+        evse.last_seen = datetime.now()
+        sent = []
+
+        async def fake_send_datagram(datagram):
+            sent.append(datagram.get_command())
+            return 0
+
+        evse.send_datagram = fake_send_datagram
+
+        await comm._poll_charge_status(evse)
+        first_poll = evse.last_poll_request
+        if first_poll is None:
+            return False, "poll request timestamp was not recorded"
+        if evse.poll_failures != 0:
+            return False, f"unexpected failures after first poll: {evse.poll_failures}"
+
+        await comm._poll_charge_status(evse)
+        if evse.poll_failures != 1:
+            return False, f"expected 1 poll failure after missed response, got {evse.poll_failures}"
+        if RequestChargeStatusRecord.COMMAND not in sent:
+            return False, "poll command was not sent"
+
+        print("  OK Poll requests and failures are tracked")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_realtime_status_poll_request():
+    """Maintenance should issue a real-time status poll request."""
+    try:
+        print("Testing real-time status polling...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import RequestStatusRecord
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.password = "123456"
+        evse._logged_in = True
+        evse.last_seen = datetime.now()
+        sent = []
+
+        async def fake_send_datagram(datagram):
+            sent.append(datagram.get_command())
+            return 0
+
+        evse.send_datagram = fake_send_datagram
+        await comm._poll_realtime_status(evse)
+
+        if evse.last_status_poll_request is None:
+            return False, "status poll timestamp was not recorded"
+        if RequestStatusRecord.COMMAND not in sent:
+            return False, "real-time status poll command was not sent"
+
+        print("  OK Real-time status polling is issued")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_poll_response_resets_failures():
+    """A received charge record should clear accumulated poll failures."""
+    try:
+        print("Testing poll response recovery...")
+
+        from protocol.communicator import Communicator
+        from protocol.datagrams import CurrentChargeRecord
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse.password = "123456"
+        evse._logged_in = True
+        evse.poll_failures = 2
+        evse.last_poll_request = datetime.now() - timedelta(seconds=1)
+
+        record = CurrentChargeRecord()
+        record.set_device_serial(evse.info.serial)
+        record.unpack_payload(bytes(97))
+
+        await comm._handle_charge_record(evse, record)
+
+        if evse.poll_failures != 0:
+            return False, "poll failures were not reset after a response"
+        if evse.last_poll_response is None:
+            return False, "poll response timestamp was not recorded"
+
+        print("  OK Poll failures reset after a response")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def test_evse_polling_diagnostics_fields():
+    """EVSE instances should expose polling and staleness diagnostics."""
+    try:
+        print("Testing EVSE polling diagnostics...")
+
+        from protocol.communicator import Communicator
+
+        comm = Communicator()
+        evse = comm.ensure_evse("7794824171431560", "10.254.2.39", 48076)
+        evse._logged_in = True
+        evse.last_seen = datetime.now()
+        evse.last_poll_request = datetime.now()
+        evse.poll_failures = 3
+
+        if not hasattr(evse, "last_poll_request") or not hasattr(evse, "last_poll_response"):
+            return False, "poll timestamp fields are missing"
+        if not hasattr(evse, "poll_failures"):
+            return False, "poll failure counter is missing"
+        if not evse.is_charge_data_stale():
+            return False, "expected missing charge data after polling to be stale"
+        if evse.poll_failures != 3:
+            return False, f"expected poll_failures=3, got {evse.poll_failures}"
+
+        print("  OK EVSE exposes polling diagnostics")
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+
 async def main():
     """Run all tests."""
     print("=== QUICK EVSE PYTHON PROTOCOL TEST ===\n")
@@ -283,6 +617,7 @@ async def main():
         ("Module imports", test_basic_import),
         ("Datagram creation", test_datagram_creation),
         ("Datagram packing", test_datagram_packing),
+        ("Invalid tail rejection", test_datagram_invalid_tail_rejected),
         ("Communicator", test_communicator_creation),
         ("Network socket", test_network_socket),
         ("Static endpoint pinning", test_static_endpoint_port_refresh),
@@ -290,6 +625,15 @@ async def main():
         ("Login fallback", test_login_fallback_after_endpoint_refresh),
         ("Direct login mode", test_direct_login_does_not_wait_for_discovery),
         ("Login failure reason", test_login_failure_reason),
+        ("Charge status ACK opcode", test_charge_status_ack_uses_0x800d),
+        ("Charge start confirmation", test_charge_start_waits_for_confirmation),
+        ("Charge stop confirmation", test_charge_stop_waits_for_confirmation),
+        ("Time sync confirmation", test_sync_time_waits_for_confirmation),
+        ("Charge data staleness", test_charge_data_stale_detection),
+        ("Poll tracking", test_polling_tracks_failures_and_requests),
+        ("Real-time status poll", test_realtime_status_poll_request),
+        ("Poll response recovery", test_poll_response_resets_failures),
+        ("EVSE polling diagnostics", test_evse_polling_diagnostics_fields),
     ]
 
     results = []

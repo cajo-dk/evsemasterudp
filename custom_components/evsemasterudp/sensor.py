@@ -203,7 +203,7 @@ class EVSEEnergySensor(EVSEBaseSensor):
     def native_value(self) -> float | None:
         """Return the consumed energy"""
         data = self.evse_data
-        return data.get("charge_kwh", 0)
+        return data.get("energy_total_kwh", 0)
 
 class EVSETemperatureSensor(EVSEBaseSensor):
     """EVSE temperature sensor"""
